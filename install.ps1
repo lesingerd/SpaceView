@@ -13,9 +13,15 @@ Write-Host "=====================================================" -ForegroundCo
 
 $repoRoot = $PSScriptRoot
 $projectFile = Join-Path $repoRoot "SpaceView\SpaceView.csproj"
+$iconGenScript = Join-Path $repoRoot "tools\generate-icon.ps1"
 
 if (-not (Test-Path $projectFile)) {
     throw "Could not find project file at: $projectFile"
+}
+
+# Ensure multi-resolution classic DIB + PNG icon is generated before building
+if (Test-Path $iconGenScript) {
+    & $iconGenScript
 }
 
 # 1. Stop any running SpaceView process so files are not locked
@@ -46,29 +52,71 @@ if (Test-Path $icoSource) {
 
 # 3. Create Start Menu Shortcut (and optional Desktop Shortcut)
 Write-Host "[3/4] Creating Start Menu shortcut..." -ForegroundColor Cyan
-$startMenuDir = [Environment]::GetFolderPath("Programs")
-$startMenuShortcutPath = Join-Path $startMenuDir "SpaceView.lnk"
 
-$wshShell = New-Object -ComObject WScript.Shell
-$shortcut = $wshShell.CreateShortcut($startMenuShortcutPath)
-$shortcut.TargetPath = $exePath
-$shortcut.WorkingDirectory = $InstallDir
-$shortcut.IconLocation = "$exePath,0"
-$shortcut.Description = "SpaceView - Disk Consumption & Live NTFS USN Monitor"
-$shortcut.Save()
+function New-AppShortcut {
+    param(
+        [string]$ShortcutPath,
+        [string]$TargetExe,
+        [string]$WorkDir,
+        [string]$IconPath
+    )
 
+    if (Test-Path $ShortcutPath) {
+        Remove-Item -Path $ShortcutPath -Force
+    }
+
+    $parentDir = Split-Path -Parent $ShortcutPath
+    if (-not (Test-Path $parentDir)) {
+        New-Item -ItemType Directory -Path $parentDir -Force | Out-Null
+    }
+
+    $wshShell = New-Object -ComObject WScript.Shell
+    $shortcut = $wshShell.CreateShortcut($ShortcutPath)
+    $shortcut.TargetPath = $TargetExe
+    $shortcut.WorkingDirectory = $WorkDir
+    $shortcut.IconLocation = "$IconPath,0"
+    $shortcut.WindowStyle = 1
+    $shortcut.Description = "SpaceView - Disk Consumption & Live NTFS USN Monitor"
+    $shortcut.Save()
+}
+
+$userProgramsDir = [Environment]::GetFolderPath("Programs")
+
+# Clean up any duplicate subfolder if present
+$oldSubfolder = Join-Path $userProgramsDir "SpaceView"
+if (Test-Path $oldSubfolder) {
+    Remove-Item -Path $oldSubfolder -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+$startMenuShortcutPath = Join-Path $userProgramsDir "SpaceView.lnk"
+New-AppShortcut -ShortcutPath $startMenuShortcutPath -TargetExe $exePath -WorkDir $InstallDir -IconPath $icoDest
 Write-Host "      Start Menu shortcut created: $startMenuShortcutPath" -ForegroundColor Green
 
 if ($CreateDesktopShortcut) {
     $desktopDir = [Environment]::GetFolderPath("Desktop")
     $desktopShortcutPath = Join-Path $desktopDir "SpaceView.lnk"
-    $deskShortcut = $wshShell.CreateShortcut($desktopShortcutPath)
-    $deskShortcut.TargetPath = $exePath
-    $deskShortcut.WorkingDirectory = $InstallDir
-    $deskShortcut.IconLocation = "$exePath,0"
-    $deskShortcut.Description = "SpaceView - Disk Consumption & Live NTFS USN Monitor"
-    $deskShortcut.Save()
+    New-AppShortcut -ShortcutPath $desktopShortcutPath -TargetExe $exePath -WorkDir $InstallDir -IconPath $icoDest
     Write-Host "      Desktop shortcut created:    $desktopShortcutPath" -ForegroundColor Green
+}
+
+# Notify Windows Shell & Start Menu indexer that shortcuts and icons changed
+try {
+    if (-not ("ShellNotify" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class ShellNotify {
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    public static extern void SHChangeNotify(int wEventId, uint uFlags, string dwItem1, IntPtr dwItem2);
+}
+"@
+    }
+    # SHCNE_CREATE (0x0002) + SHCNE_UPDATEDIR (0x1000) + SHCNE_ASSOCCHANGED (0x08000000)
+    [ShellNotify]::SHChangeNotify(0x00000002, 0x0005, $startMenuShortcutPath, [IntPtr]::Zero)
+    [ShellNotify]::SHChangeNotify(0x00001000, 0x0005, $userProgramsDir, [IntPtr]::Zero)
+    [ShellNotify]::SHChangeNotify(0x08000000, 0x0000, $null, [IntPtr]::Zero)
+} catch {
+    # Non-fatal if shell notification fails
 }
 
 # 4. Launch installed application

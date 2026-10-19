@@ -21,10 +21,23 @@ if ($running) {
 
 # 2. Remove shortcuts
 Write-Host "[2/3] Removing shortcuts..." -ForegroundColor Cyan
-$startMenuShortcut = Join-Path ([Environment]::GetFolderPath("Programs")) "SpaceView.lnk"
+$userProgramsDir = [Environment]::GetFolderPath("Programs")
+
+$startMenuShortcut = Join-Path $userProgramsDir "SpaceView.lnk"
 if (Test-Path $startMenuShortcut) {
     Remove-Item -Path $startMenuShortcut -Force
     Write-Host "      Removed Start Menu shortcut: $startMenuShortcut" -ForegroundColor Green
+}
+
+$startMenuFolder = Join-Path $userProgramsDir "SpaceView"
+if (Test-Path $startMenuFolder) {
+    Remove-Item -Path $startMenuFolder -Recurse -Force
+    Write-Host "      Removed Start Menu folder:   $startMenuFolder" -ForegroundColor Green
+}
+
+$commonShortcut = Join-Path ([Environment]::GetFolderPath("CommonPrograms")) "SpaceView.lnk"
+if (Test-Path $commonShortcut) {
+    Remove-Item -Path $commonShortcut -Force -ErrorAction SilentlyContinue
 }
 
 $desktopShortcut = Join-Path ([Environment]::GetFolderPath("Desktop")) "SpaceView.lnk"

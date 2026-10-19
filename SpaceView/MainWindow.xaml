@@ -3,6 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:models="clr-namespace:SpaceView.Models"
         Title="SpaceView — Disk Consumption &amp; Live NTFS USN Monitor"
+        Icon="pack://application:,,,/Assets/SpaceView.ico"
         Width="1200"
         Height="720"
         MinWidth="820"

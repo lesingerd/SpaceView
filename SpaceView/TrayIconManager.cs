@@ -131,6 +131,23 @@ public sealed class TrayIconManager : IDisposable
 
     private static Icon CreateStorageTrayIcon()
     {
+        try
+        {
+            string? exePath = Environment.ProcessPath;
+            if (!string.IsNullOrEmpty(exePath) && System.IO.File.Exists(exePath))
+            {
+                Icon? associated = Icon.ExtractAssociatedIcon(exePath);
+                if (associated != null)
+                {
+                    return associated;
+                }
+            }
+        }
+        catch
+        {
+            // Fallback to programmatic drawing if extraction fails
+        }
+
         using var bmp = new Bitmap(32, 32);
         using (var g = Graphics.FromImage(bmp))
         {

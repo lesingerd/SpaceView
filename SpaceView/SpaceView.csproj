@@ -9,10 +9,15 @@
     <UseWindowsForms>true</UseWindowsForms>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\SpaceView.ico</ApplicationIcon>
     <AssemblyName>SpaceView</AssemblyName>
     <RootNamespace>SpaceView</RootNamespace>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <Optimize Condition="'$(Configuration)' == 'Release'">true</Optimize>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\SpaceView.ico" />
+  </ItemGroup>
 
 </Project>

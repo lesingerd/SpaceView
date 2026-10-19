@@ -46,11 +46,15 @@ When launched, SpaceView presents a drive selector drop-down displaying all read
 ```text
 SpaceView/
 ├── SpaceView.sln                        # Visual Studio 2022 Solution
+├── install.ps1 / install.bat            # Installer script (publishes to LocalAppData & creates Start Menu icon)
+├── uninstall.ps1 / uninstall.bat        # Uninstaller script
 ├── Screenshot.png                       # Main application screenshot
 ├── Screenshot_Tray.png                  # System tray hover popup screenshot
 └── SpaceView/
     ├── SpaceView.csproj                 # .NET 8 WPF / WinForms interop project
     ├── app.manifest                     # Long-path & Windows 10/11 compatibility manifest
+    ├── Assets/
+    │   └── SpaceView.ico                # Multi-resolution application & system tray icon
     ├── App.xaml / App.xaml.cs           # Application entry & theme resources
     ├── MainWindow.xaml / .cs            # Main virtualized TreeListView UI & controller
     ├── TrayHoverWindow.xaml / .cs       # System tray hover popup window
@@ -69,13 +73,24 @@ SpaceView/
 
 ---
 
-## Building and Running
+## Installation & Building
 
 ### Prerequisites
 - Windows 10 or Windows 11
 - [.NET 8.0 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) or Visual Studio 2022
 
-### Build & Run via CLI
+### Quick Install (Local Program Folder + Start Menu Shortcut)
+Double-click `install.bat` or run `install.ps1` from PowerShell:
+```powershell
+.\install.ps1
+```
+This publishes the Release binaries to `%LOCALAPPDATA%\Programs\SpaceView`, registers the **SpaceView** shortcut (with the embedded `SpaceView.ico` icon) in your Windows Start Menu (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\SpaceView.lnk`), and launches the installed app.
+
+- To also create a Desktop shortcut: `.\install.ps1 -CreateDesktopShortcut`
+- To install to a custom folder: `.\install.ps1 -InstallDir "C:\Tools\SpaceView"`
+- To uninstall: double-click `uninstall.bat` or run `.\uninstall.ps1`
+
+### Build & Run Manually via CLI
 ```powershell
 dotnet build SpaceView.sln -c Release
 .\SpaceView\bin\Release\net8.0-windows\SpaceView.exe

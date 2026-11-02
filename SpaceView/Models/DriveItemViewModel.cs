@@ -70,16 +70,53 @@ public sealed class DriveItemViewModel
         BarBrush.Freeze();
     }
 
-    public static List<DriveItemViewModel> GetReadyDrives()
+    /// <summary>How long one enumeration waits for the drives to answer before reporting the slow ones as unresponsive.</summary>
+    private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(3);
+
+    private static readonly object EnumerationLock = new();
+    private static Task<DriveEnumeration>? _enumeration;      // the one enumeration in flight (null or completed: none)
+    private static readonly Dictionary<string, Task<DriveItemViewModel?>> Probes = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, DriveItemViewModel> LastGoodByName = new(StringComparer.OrdinalIgnoreCase);
+    private static volatile DriveEnumeration _lastResult = new(new List<DriveItemViewModel>(), new List<string>());
+
+    /// <summary>The result of the most recent enumeration that finished (empty before the first one), for callers that must not wait.</summary>
+    public static DriveEnumeration LastResult => _lastResult;
+
+    /// <summary>
+    /// Lists the ready drives without ever blocking the caller on a drive that does not answer (a sleeping disk, a dead
+    /// network share, an optical drive spinning up). Each drive is probed on its own background task, and only one
+    /// enumeration runs at a time: callers that arrive meanwhile share it. A drive that has not answered within the
+    /// timeout is reported in <see cref="DriveEnumeration.Unresponsive"/> (with its last known details if there are any, so
+    /// it does not drop out of a list); its probe is not repeated until it returns, so a hung drive never piles up tasks.
+    /// </summary>
+    public static Task<DriveEnumeration> GetReadyDrivesAsync()
     {
-        var list = new List<DriveItemViewModel>();
+        lock (EnumerationLock)
+        {
+            if (_enumeration == null || _enumeration.IsCompleted)
+                _enumeration = Task.Run(EnumerateDrivesAsync);
+            return _enumeration;
+        }
+    }
+
+    private static async Task<DriveEnumeration> EnumerateDrivesAsync()
+    {
+        var probes = new List<(string Name, Task<DriveItemViewModel?> Probe)>();
         try
         {
-            foreach (var d in DriveInfo.GetDrives())
+            DriveInfo[] drives = DriveInfo.GetDrives();
+            lock (EnumerationLock)
             {
-                if (d.IsReady)
+                foreach (DriveInfo d in drives)
                 {
-                    list.Add(new DriveItemViewModel(d));
+                    // A probe still running from an earlier enumeration (a hung drive) is waited on again, not restarted
+                    if (!Probes.TryGetValue(d.Name, out Task<DriveItemViewModel?>? probe) || probe.IsCompleted)
+                    {
+                        DriveInfo drive = d;
+                        probe = Task.Run(() => ProbeDrive(drive));
+                        Probes[d.Name] = probe;
+                    }
+                    probes.Add((d.Name, probe));
                 }
             }
         }
@@ -87,6 +124,65 @@ public sealed class DriveItemViewModel
         {
             // Ignore enumeration errors
         }
-        return list;
+
+        Task all = Task.WhenAll(probes.Select(p => p.Probe));
+        await Task.WhenAny(all, Task.Delay(ProbeTimeout)).ConfigureAwait(false);
+
+        var ready = new List<DriveItemViewModel>();
+        var unresponsive = new List<string>();
+        lock (EnumerationLock)
+        {
+            foreach ((string name, Task<DriveItemViewModel?> probe) in probes)
+            {
+                if (probe.IsCompletedSuccessfully)
+                {
+                    if (probe.Result is { } item)
+                    {
+                        ready.Add(item);
+                        LastGoodByName[name] = item;
+                    }
+                    else
+                    {
+                        LastGoodByName.Remove(name); // not ready (no media) or unreadable
+                    }
+                }
+                else if (!probe.IsCompleted)
+                {
+                    unresponsive.Add(name);
+                    if (LastGoodByName.TryGetValue(name, out DriveItemViewModel? lastGood))
+                        ready.Add(lastGood);
+                }
+            }
+        }
+
+        var result = new DriveEnumeration(ready, unresponsive);
+        _lastResult = result;
+        return result;
+    }
+
+    private static DriveItemViewModel? ProbeDrive(DriveInfo drive)
+    {
+        try
+        {
+            return drive.IsReady ? new DriveItemViewModel(drive) : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+}
+
+public sealed class DriveEnumeration
+{
+    /// <summary>Drives that are ready, plus the last known details of drives that did not answer in time.</summary>
+    public IReadOnlyList<DriveItemViewModel> Drives { get; }
+    /// <summary>Names of drives that did not answer in time.</summary>
+    public IReadOnlyList<string> Unresponsive { get; }
+
+    public DriveEnumeration(IReadOnlyList<DriveItemViewModel> drives, IReadOnlyList<string> unresponsive)
+    {
+        Drives = drives;
+        Unresponsive = unresponsive;
     }
 }

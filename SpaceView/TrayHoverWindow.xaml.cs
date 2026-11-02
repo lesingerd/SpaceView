@@ -12,9 +12,36 @@ public partial class TrayHoverWindow : Window
         InitializeComponent();
     }
 
+    /// <summary>
+    /// Shows the last known drive list at once and positions the window; the list is then refreshed in the background
+    /// (a drive that hangs must not freeze the tray) and the window is positioned again if it changed.
+    /// </summary>
     public void RefreshAndPositionNearCursor()
     {
-        DrivesItemsControl.ItemsSource = DriveItemViewModel.GetReadyDrives();
+        DrivesItemsControl.ItemsSource = DriveItemViewModel.LastResult.Drives;
+        PositionNearCursor();
+        _ = RefreshDrivesAsync();
+    }
+
+    private async Task RefreshDrivesAsync()
+    {
+        try
+        {
+            DriveEnumeration result = await DriveItemViewModel.GetReadyDrivesAsync();
+            if (!IsVisible)
+                return;
+
+            DrivesItemsControl.ItemsSource = result.Drives;
+            PositionNearCursor();
+        }
+        catch
+        {
+            // Keep showing the previous list
+        }
+    }
+
+    private void PositionNearCursor()
+    {
         UpdateLayout();
 
         NtfsNative.GetCursorPos(out var pt);

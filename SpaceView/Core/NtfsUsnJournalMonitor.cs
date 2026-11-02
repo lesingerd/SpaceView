@@ -12,6 +12,12 @@ public sealed class UsnMonitorEventArgs : EventArgs
     public long TotalEventsProcessed { get; init; }
     public string LastChangedItem { get; init; } = string.Empty;
     public bool IsUsnJournalMode { get; init; }
+
+    /// <summary>
+    /// Store nodes this batch created, changed, moved (the node and its old parent), deleted or unlinked. A deleted
+    /// node keeps its parent link, so its chain can still be walked. Capped at <see cref="FileSystemStore.MaxActivityNodes"/>.
+    /// </summary>
+    public IReadOnlyCollection<int> ChangedNodes { get; init; } = Array.Empty<int>();
 }
 
 public enum UsnMonitorStatusKind
@@ -350,6 +356,7 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
             return;
 
         int appliedCount = ApplyBatch(hVolume, batch, ct);
+        int[] changedNodes = _store.TakeActivity();
 
         if (appliedCount > 0)
         {
@@ -359,7 +366,8 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
                 BatchEventsProcessed = appliedCount,
                 TotalEventsProcessed = total,
                 LastChangedItem = batch.LastItemName,
-                IsUsnJournalMode = true
+                IsUsnJournalMode = true,
+                ChangedNodes = changedNodes
             });
         }
     }
@@ -665,6 +673,7 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         try
         {
             int applied = HandleFallbackEvent(fullPath, isDelete, expandNewDirectory: true, isRename);
+            int[] changedNodes = _store.TakeActivity();
             if (applied > 0)
             {
                 long total = Interlocked.Add(ref _totalEventsProcessed, applied);
@@ -673,7 +682,8 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
                     BatchEventsProcessed = applied,
                     TotalEventsProcessed = total,
                     LastChangedItem = Path.GetFileName(fullPath),
-                    IsUsnJournalMode = false
+                    IsUsnJournalMode = false,
+                    ChangedNodes = changedNodes
                 });
             }
         }

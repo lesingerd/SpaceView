@@ -1090,6 +1090,9 @@ public partial class MainWindow : Window
 
     private void OnUsnChangesDetected(DriveSession session, NtfsUsnJournalMonitor monitor, UsnMonitorEventArgs e)
     {
+        // Changed nodes are collected for every batch (the coalesced passes below only see the newest args)
+        session.AddActivity(monitor, e.ChangedNodes);
+
         // Always publish the newest args; only the first event after a refresh schedules a new one
         if (!session.TryBeginUiRefresh(e))
             return;
@@ -1195,6 +1198,7 @@ public partial class MainWindow : Window
 
     private void ApplyLiveStoreUpdatesToVisibleRows(DriveSession session, UsnMonitorEventArgs e)
     {
+        HashSet<int> activity = session.TakeActivity();
         FileSystemStore? store = session.Store;
         if (store == null || !TryGetSessionBlock(session, out int start, out int end))
             return;
@@ -1323,6 +1327,9 @@ public partial class MainWindow : Window
         RefreshSessionRows(session);
         UpdateStatsText();
 
+        // The rows now match the store, so the changed nodes can be placed on them
+        PulseActivityRows(session, store, activity, start, end);
+
         // 5. Update top USN badge (it describes the first drive)
         if (_sessions.Count > 0 && ReferenceEquals(_sessions[0], session))
         {
@@ -1330,6 +1337,31 @@ public partial class MainWindow : Window
             string modeLabel = e.IsUsnJournalMode ? "NTFS USN Journal" : "Limited Monitor (FileSystemWatcher)";
             SetMonitorBadgeText($"{drive} {(e.IsUsnJournalMode ? "USN live" : "Limited")}: {e.TotalEventsProcessed:N0} updates",
                 $"{drive} {modeLabel}: {e.TotalEventsProcessed:N0} updates ({e.LastChangedItem})");
+        }
+    }
+
+    /// <summary>
+    /// Flashes, for each changed node, the lowest row that is displayed and contains it (see <see cref="ActivityTargets"/>).
+    /// A change under a "more items" cut-off lights the folder's row, not the "more items" row. Skipped when Windows
+    /// animations are off. <paramref name="end"/> is the end of the drive's block after the rows were brought up to date.
+    /// </summary>
+    private void PulseActivityRows(DriveSession session, FileSystemStore store, HashSet<int> activity, int start, int end)
+    {
+        if (activity.Count == 0 || !SystemParameters.ClientAreaAnimation)
+            return;
+
+        var displayed = new Dictionary<RowKey, TreeRowViewModel>(end - start);
+        for (int i = start; i < end; i++)
+        {
+            TreeRowViewModel row = _visibleRows[i];
+            if (!row.IsMoreRow)
+                displayed[row.Key] = row;
+        }
+
+        long now = Environment.TickCount64;
+        foreach (TreeRowViewModel row in ActivityTargets.Resolve(store, session, activity, displayed))
+        {
+            row.Pulse(now);
         }
     }
 
@@ -2170,6 +2202,9 @@ public partial class MainWindow : Window
 
         if (!store.GraftBranch(nodeId, scan.Store))
             throw new InvalidOperationException("The folder is no longer a live directory in the tree.");
+
+        // The rebuilt branch is not activity; node ids collected before the graft no longer describe it
+        session.ClearActivity();
 
         if (rowIndex >= 0)
         {

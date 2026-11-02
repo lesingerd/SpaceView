@@ -110,6 +110,13 @@ public sealed class FileSystemStore
     // tombstoned ones that are skipped on use).
     private readonly Dictionary<ulong, List<int>> _linkGroups = new();
 
+    // Nodes touched by live (journal / watcher) updates since the last TakeActivity, for the activity highlight.
+    // Guarded by _syncLock like every other mutation; capped so a busy volume cannot grow it without bound.
+    private readonly HashSet<int> _activity = new();
+
+    /// <summary>Most distinct nodes remembered between two <see cref="TakeActivity"/> calls (also kept per drive between UI passes, and resolved per pass).</summary>
+    public const int MaxActivityNodes = 4096;
+
     public string RootPath { get; }
     public int RootNodeId => 0;
 
@@ -747,6 +754,44 @@ public sealed class FileSystemStore
     // Real-time NTFS USN Journal Incremental Mutation Operations
     // =========================================================================
 
+    /// <summary>Remembers a node touched by a live update (call under the lock). Beyond the cap further nodes are dropped.</summary>
+    private void NoteActivityUnsafe(int nodeId)
+    {
+        if (_activity.Count < MaxActivityNodes)
+            _activity.Add(nodeId);
+    }
+
+    /// <summary>
+    /// Returns the nodes that live updates (created, changed, renamed/moved - the old parent too -, deleted or unlinked)
+    /// touched since the last call, and forgets them. A deleted node stays in the list and keeps its parent link.
+    /// </summary>
+    public int[] TakeActivity()
+    {
+        lock (_syncLock)
+        {
+            if (_activity.Count == 0)
+                return Array.Empty<int>();
+
+            int[] nodes = new int[_activity.Count];
+            _activity.CopyTo(nodes);
+            _activity.Clear();
+            return nodes;
+        }
+    }
+
+    /// <summary>
+    /// Runs <paramref name="read"/> with the store lock held, once, handing it a parent lookup (-1 for the root or an
+    /// unknown id). Works for deleted nodes too, whose parent link is kept, so a batch can walk many ancestor chains
+    /// under a single lock acquisition. The callback must be quick and must not call back into the store.
+    /// </summary>
+    public void ReadParents(Action<Func<int, int>> read)
+    {
+        lock (_syncLock)
+        {
+            read(id => id >= 0 && id < _nodeCount ? GetNodeRef(id).ParentId : -1);
+        }
+    }
+
     public UsnApplyResult ApplyUsnCreateOrUpdate(
         ulong fileId,
         ulong parentFileId,
@@ -782,6 +827,7 @@ public sealed class FileSystemStore
                         parentRec.FirstChildId = linkId;
                         RegisterLinkUnsafe(fileId, existingNodeId, linkId);
                         PropagateDeltaUnsafe(newParentId, 0, 1, 0);
+                        NoteActivityUnsafe(linkId);
                     }
                     // else: the name is already tracked, or it lives outside the tracked tree
                 }
@@ -795,12 +841,14 @@ public sealed class FileSystemStore
                             return UsnApplyResult.ParentUnmapped;
 
                         // Moved out of the tracked tree: it no longer counts here
+                        NoteActivityUnsafe(existingNodeId);
                         DeleteNodeUnsafe(existingNodeId);
                         return UsnApplyResult.Applied;
                     }
                 }
                 else if (newParentId != existing.ParentId)
                 {
+                    NoteActivityUnsafe(existing.ParentId); // the old location
                     MoveNodeParentUnsafe(existingNodeId, newParentId);
                 }
 
@@ -823,6 +871,7 @@ public sealed class FileSystemStore
                         PropagateDeltaUnsafe(fileRec.ParentId, sizeDelta, 0, 0);
                     }
                 }
+                NoteActivityUnsafe(existingNodeId);
                 return UsnApplyResult.Applied;
             }
             else
@@ -851,6 +900,7 @@ public sealed class FileSystemStore
                         if (delta != 0)
                             PropagateDeltaUnsafe(parentNodeId, delta, 0, 0);
                     }
+                    NoteActivityUnsafe(existingByName);
                     return UsnApplyResult.Applied;
                 }
 
@@ -870,6 +920,7 @@ public sealed class FileSystemStore
                     isDirectory ? 0 : 1,
                     isDirectory ? 1 : 0);
 
+                NoteActivityUnsafe(nodeId);
                 return UsnApplyResult.Applied;
             }
         }
@@ -904,6 +955,8 @@ public sealed class FileSystemStore
             if (targetNodeId <= 0)
                 return false;
 
+            NoteActivityUnsafe(targetNodeId);
+
             // A delete record by FRN means the file itself is gone, so every name of a hard-linked file goes
             // (the extra links first, so the carrier has no heir to hand its size to)
             ulong targetFileId = GetNodeRef(targetNodeId).FileId;
@@ -936,6 +989,7 @@ public sealed class FileSystemStore
             if (linkId <= 0)
                 return false;
 
+            NoteActivityUnsafe(linkId);
             DeleteNodeUnsafe(linkId);
             return true;
         }

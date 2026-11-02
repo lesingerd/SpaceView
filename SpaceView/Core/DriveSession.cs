@@ -274,7 +274,7 @@ public sealed class DriveSession : IDisposable
             if (State == DriveSessionState.Failed)
                 return $"✖ Scan failed: {ScanError}";
             if (IsStale)
-                return "⚠ Stale: select this drive or use Refresh to rescan";
+                return "⚠ Stale: select to rescan";
             if (!string.IsNullOrEmpty(MonitorProblem))
                 return $"⚠ {MonitorProblem}";
             return string.Empty;

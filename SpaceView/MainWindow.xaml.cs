@@ -1159,30 +1159,38 @@ public partial class MainWindow : Window
         if (first.IsUnavailable)
         {
             UsnStatusDot.Fill = new SolidColorBrush(Color.FromRgb(148, 163, 184));
-            UsnStatusText.Text = $"{drive} not available (showing last scan)";
+            SetMonitorBadgeText($"{drive} not available", $"{drive} not available (showing last scan)");
         }
         else if (first.Monitor == null)
         {
             UsnStatusDot.Fill = new SolidColorBrush(Color.FromRgb(148, 163, 184));
-            UsnStatusText.Text = $"{drive} {first.DriveFormat} Volume (Non-NTFS)";
+            SetMonitorBadgeText($"{drive} {first.DriveFormat} (no USN)", $"{drive} {first.DriveFormat} Volume (Non-NTFS)");
         }
         else if (!string.IsNullOrEmpty(first.MonitorProblem))
         {
             UsnStatusDot.Fill = new SolidColorBrush(Color.FromRgb(245, 158, 11)); // Amber
-            UsnStatusText.Text = $"{drive} Live monitoring problem (see status bar)";
+            SetMonitorBadgeText($"{drive} Monitoring problem", $"{drive} Live monitoring problem (see status bar)");
         }
         else if (first.Monitor.IsUsnJournalActive)
         {
             UsnStatusDot.Fill = new SolidColorBrush(Color.FromRgb(16, 185, 129)); // Emerald green
-            UsnStatusText.Text = $"{drive} NTFS USN Journal Active (Live Monitoring)";
+            SetMonitorBadgeText($"{drive} USN live monitoring", $"{drive} NTFS USN Journal Active (Live Monitoring)");
         }
         else
         {
             UsnStatusDot.Fill = new SolidColorBrush(Color.FromRgb(56, 189, 248)); // Cyan
-            UsnStatusText.Text = ElevationHelper.IsElevated
-                ? $"{drive} Limited Monitoring: FileSystemWatcher (USN journal unavailable)"
-                : $"{drive} Limited Monitoring: FileSystemWatcher (not elevated)";
+            SetMonitorBadgeText($"{drive} Limited monitoring",
+                ElevationHelper.IsElevated
+                    ? $"{drive} Limited Monitoring: FileSystemWatcher (USN journal unavailable)"
+                    : $"{drive} Limited Monitoring: FileSystemWatcher (not elevated)");
         }
+    }
+
+    /// <summary>Short text on the toolbar badge (it must fit beside the buttons); the full wording is its tooltip.</summary>
+    private void SetMonitorBadgeText(string shortText, string fullText)
+    {
+        UsnStatusText.Text = shortText;
+        UsnStatusBadge.ToolTip = fullText;
     }
 
     private void ApplyLiveStoreUpdatesToVisibleRows(DriveSession session, UsnMonitorEventArgs e)
@@ -1318,8 +1326,10 @@ public partial class MainWindow : Window
         // 5. Update top USN badge (it describes the first drive)
         if (_sessions.Count > 0 && ReferenceEquals(_sessions[0], session))
         {
+            string drive = session.RootPath.TrimEnd('\\');
             string modeLabel = e.IsUsnJournalMode ? "NTFS USN Journal" : "Limited Monitor (FileSystemWatcher)";
-            UsnStatusText.Text = $"{session.RootPath.TrimEnd('\\')} {modeLabel}: {e.TotalEventsProcessed:N0} updates ({e.LastChangedItem})";
+            SetMonitorBadgeText($"{drive} {(e.IsUsnJournalMode ? "USN live" : "Limited")}: {e.TotalEventsProcessed:N0} updates",
+                $"{drive} {modeLabel}: {e.TotalEventsProcessed:N0} updates ({e.LastChangedItem})");
         }
     }
 

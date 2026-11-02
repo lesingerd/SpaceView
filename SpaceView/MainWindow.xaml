@@ -121,7 +121,7 @@
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="360"/>
+                    <ColumnDefinition Width="*" MinWidth="250" MaxWidth="360"/>
                     <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
@@ -347,11 +347,16 @@
                             </Grid.ColumnDefinitions>
 
                             <!-- Column 0: Indented Tree Node (Chevron + Icon + Name) -->
-                            <StackPanel Grid.Column="0"
-                                        Orientation="Horizontal"
-                                        Margin="{Binding IndentMargin}"
-                                        ToolTip="{Binding ToolTipText}"
-                                        VerticalAlignment="Center">
+                            <Grid Grid.Column="0"
+                                  ToolTip="{Binding ToolTipText}"
+                                  VerticalAlignment="Center">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                            <StackPanel Orientation="Horizontal" Margin="{Binding IndentMargin}">
                                 <ToggleButton Style="{StaticResource TreeChevronStyle}"
                                               Visibility="{Binding ExpandButtonVisibility}"
                                               IsChecked="{Binding IsExpanded, Mode=OneWay}"
@@ -392,8 +397,10 @@
                                         </Path.Style>
                                     </Path>
                                 </Grid>
+                            </StackPanel>
 
-                                <TextBlock Text="{Binding Name}"
+                                <TextBlock Grid.Column="1"
+                                           Text="{Binding Name}"
                                            FontSize="12.5"
                                            VerticalAlignment="Center"
                                            TextTrimming="CharacterEllipsis">
@@ -413,21 +420,24 @@
                                     </TextBlock.Style>
                                 </TextBlock>
 
-                                <!-- Drive rows only: format, free space and monitor mode, then a state marker -->
-                                <TextBlock Text="{Binding SubText}"
+                                <!-- Drive rows only: a state marker that never shrinks, then format, free space and monitor mode (trims first) -->
+                                <TextBlock Grid.Column="3"
+                                           Text="{Binding SubText}"
+                                           TextTrimming="CharacterEllipsis"
                                            Visibility="{Binding SubTextVisibility}"
                                            Foreground="#94A3B8"
                                            FontSize="11.5"
                                            Margin="12,0,0,0"
                                            VerticalAlignment="Center"/>
-                                <TextBlock Text="{Binding Marker}"
+                                <TextBlock Grid.Column="2"
+                                           Text="{Binding Marker}"
                                            Visibility="{Binding MarkerVisibility}"
                                            Foreground="#F59E0B"
                                            FontSize="11.5"
                                            FontWeight="SemiBold"
                                            Margin="12,0,0,0"
                                            VerticalAlignment="Center"/>
-                            </StackPanel>
+                            </Grid>
 
                             <!-- Column 1: % of Parent Bar + Text -->
                             <Grid Grid.Column="1" Margin="8,2,8,2" VerticalAlignment="Center" Visibility="{Binding DetailVisibility}">
@@ -460,9 +470,21 @@
                                            Foreground="#F8FAFC"
                                            FontWeight="SemiBold"
                                            FontSize="11.5"
-                                           HorizontalAlignment="Right"
-                                           VerticalAlignment="Center"
-                                           Margin="0,0,8,0"/>
+                                           VerticalAlignment="Center">
+                                    <TextBlock.Style>
+                                        <!-- Root rows: label centred across the whole track so it stays inside the bar at any percent -->
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="HorizontalAlignment" Value="Right"/>
+                                            <Setter Property="Margin" Value="0,0,8,0"/>
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsRoot}" Value="True">
+                                                    <Setter Property="HorizontalAlignment" Value="Center"/>
+                                                    <Setter Property="Margin" Value="0"/>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
                             </Grid>
 
                             <!-- Column 2: Size -->
@@ -542,9 +564,9 @@
                 Padding="16,8">
             <Grid>
                 <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="*" MinWidth="160"/>
                     <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*" MaxWidth="320"/>
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
 
@@ -579,8 +601,7 @@
                            FontSize="12"
                            FontWeight="Medium"
                            VerticalAlignment="Center"
-                           Margin="20,0"
-                           MaxWidth="420"
+                           Margin="16,0"
                            TextTrimming="CharacterEllipsis"
                            ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/>
 

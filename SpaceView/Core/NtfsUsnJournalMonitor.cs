@@ -1,4 +1,5 @@
 using System.IO;
+using System.IO.Enumeration;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 using SpaceView.Native;
@@ -13,6 +14,20 @@ public sealed class UsnMonitorEventArgs : EventArgs
     public bool IsUsnJournalMode { get; init; }
 }
 
+public enum UsnMonitorStatusKind
+{
+    /// <summary>The monitor could not use the USN journal and switched to the FileSystemWatcher fallback.</summary>
+    FellBackToWatcher,
+    /// <summary>Something went wrong; live data may be incomplete until a rescan.</summary>
+    Fault
+}
+
+public sealed class UsnMonitorStatusEventArgs : EventArgs
+{
+    public UsnMonitorStatusKind Kind { get; init; }
+    public string Message { get; init; } = string.Empty;
+}
+
 /// <summary>
 /// Real-time NTFS USN Change Journal monitor that reads FSCTL_READ_USN_JOURNAL records
 /// and updates the FileSystemStore in place with O(depth) delta propagation.
@@ -22,6 +37,12 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
 {
     private const uint ReadBufferSize = 64 * 1024;
 
+    // MFT records 0-23 are reserved for NTFS metadata files ($MFT, $LogFile, $Bitmap, ...)
+    private const ulong MftIndexMask = 0x0000FFFFFFFFFFFFUL;
+    private const ulong FirstUserMftIndex = 24;
+
+    private const int MaxFallbackDirectoryEntries = 2000;
+
     private const uint MonitoredReasons =
         NtfsNative.USN_REASON_FILE_CREATE |
         NtfsNative.USN_REASON_FILE_DELETE |
@@ -30,22 +51,59 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         NtfsNative.USN_REASON_DATA_OVERWRITE |
         NtfsNative.USN_REASON_RENAME_OLD_NAME |
         NtfsNative.USN_REASON_RENAME_NEW_NAME |
+        NtfsNative.USN_REASON_HARD_LINK_CHANGE |
         NtfsNative.USN_REASON_CLOSE;
 
+    private struct UsnBatchItem
+    {
+        public ulong ParentFrn;
+        public string Name;
+        public uint CombinedReason;
+        public uint Attrs;
+    }
+
+    /// <summary>Records of one poll, keyed by FRN but remembered in USN (first-seen) order.</summary>
+    private sealed class UsnBatch
+    {
+        public readonly Dictionary<ulong, UsnBatchItem> Items = new(256);
+        public readonly List<ulong> Order = new(256);
+        public string LastItemName = string.Empty;
+
+        public void Clear()
+        {
+            Items.Clear();
+            Order.Clear();
+            LastItemName = string.Empty;
+        }
+    }
+
     private readonly FileSystemStore _store;
-    private readonly ulong _journalId;
+    private ulong _journalId;
     private long _nextUsn;
-    private readonly bool _useUsnJournal;
+    private volatile bool _usnActive;
     private readonly CancellationTokenSource _cts = new();
     private Task? _monitorTask;
     private FileSystemWatcher? _fallbackWatcher;
     private long _totalEventsProcessed;
+    private int _rescanSignalled;
+    private string? _lastFaultMessage;
+    private bool _faultReportedThisPoll;
     private bool _disposed;
 
-    public bool IsUsnJournalActive => _useUsnJournal;
+    // Held while a journal batch is read and applied, so a pause request waits for an in-flight batch
+    private readonly object _applyGate = new();
+    private int _pauseCount;
+
+    public bool IsUsnJournalActive => _usnActive;
     public long TotalEventsProcessed => Interlocked.Read(ref _totalEventsProcessed);
 
     public event EventHandler<UsnMonitorEventArgs>? ChangesDetected;
+
+    /// <summary>Raised (on a background thread) when the monitor lost track of changes and the tree must be rebuilt.</summary>
+    public event EventHandler<string>? RescanRequired;
+
+    /// <summary>Raised (on a background thread) for faults and for a switch to the fallback watcher.</summary>
+    public event EventHandler<UsnMonitorStatusEventArgs>? StatusChanged;
 
     public NtfsUsnJournalMonitor(
         FileSystemStore store,
@@ -56,12 +114,12 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         _store = store;
         _journalId = journalId;
         _nextUsn = startUsn;
-        _useUsnJournal = usnReady && journalId != 0;
+        _usnActive = usnReady && journalId != 0;
     }
 
     public void Start()
     {
-        if (_useUsnJournal)
+        if (_usnActive)
         {
             _monitorTask = Task.Run(() => RunUsnJournalLoopAsync(_cts.Token));
         }
@@ -71,42 +129,108 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         }
     }
 
+    /// <summary>
+    /// Stops applying USN journal records until the returned scope is disposed (dispose is idempotent and safe
+    /// after the monitor itself was disposed). Returns once any batch already being applied has finished, so
+    /// everything applied before the pause is visible to a scan started afterwards. While paused nothing is
+    /// read and <c>_nextUsn</c> does not move: the records of the pause stay in the journal and are applied,
+    /// in order, after the resume. That replay is what keeps changes made during a branch scan from being lost
+    /// when the scanned subtree replaces the old one. It is idempotent because updates are keyed by FRN, sizes
+    /// are read fresh (absolute), a create/update for a node that already matches changes nothing, and a
+    /// delete only removes a node whose FRN (or name, for an unmapped FRN) still matches.
+    /// If the journal wraps meanwhile, the first read after the resume fails and RescanRequired is raised as usual.
+    /// In FileSystemWatcher mode nothing is paused (the watcher applies events immediately), so changes made
+    /// during the scan can be lost until the next rescan.
+    /// </summary>
+    public IDisposable PauseApplyingChanges()
+    {
+        lock (_applyGate)
+        {
+            _pauseCount++;
+        }
+        return new PauseScope(this);
+    }
+
+    private void ResumeApplying()
+    {
+        lock (_applyGate)
+        {
+            if (_pauseCount > 0)
+                _pauseCount--;
+        }
+    }
+
+    private sealed class PauseScope : IDisposable
+    {
+        private NtfsUsnJournalMonitor? _owner;
+
+        public PauseScope(NtfsUsnJournalMonitor owner) => _owner = owner;
+
+        public void Dispose() => Interlocked.Exchange(ref _owner, null)?.ResumeApplying();
+    }
+
     private async Task RunUsnJournalLoopAsync(CancellationToken ct)
     {
-        string volumeDevicePath = @"\\.\" + _store.RootPath.TrimEnd('\\');
-        using SafeFileHandle hVolume = NtfsNative.CreateFileW(
-            volumeDevicePath,
-            NtfsNative.GENERIC_READ,
-            NtfsNative.FILE_SHARE_ALL,
-            IntPtr.Zero,
-            NtfsNative.OPEN_EXISTING,
-            0,
-            IntPtr.Zero);
-
-        if (hVolume.IsInvalid)
-        {
-            StartFallbackWatcher();
-            return;
-        }
-
-        IntPtr bufferPtr = AllocateAlignedBuffer();
         try
         {
-            var seenInBatch = new Dictionary<ulong, (ulong ParentFrn, string Name, uint CombinedReason, uint Attrs)>(256);
+            string volumeDevicePath = @"\\.\" + _store.RootPath.TrimEnd('\\');
+            using SafeFileHandle hVolume = NtfsNative.CreateFileW(
+                volumeDevicePath,
+                NtfsNative.GENERIC_READ,
+                NtfsNative.FILE_SHARE_ALL,
+                IntPtr.Zero,
+                NtfsNative.OPEN_EXISTING,
+                0,
+                IntPtr.Zero);
 
-            while (!ct.IsCancellationRequested)
+            if (hVolume.IsInvalid)
             {
-                await Task.Delay(400, ct).ConfigureAwait(false);
-                PollAndApplyUsnBatch(hVolume, bufferPtr, seenInBatch, ct);
+                int err = Marshal.GetLastWin32Error();
+                SwitchToFallback($"Could not open the volume for USN journal access (Win32 error {err})");
+                return;
+            }
+
+            IntPtr bufferPtr = AllocateAlignedBuffer();
+            try
+            {
+                var batch = new UsnBatch();
+
+                while (!ct.IsCancellationRequested)
+                {
+                    await Task.Delay(400, ct).ConfigureAwait(false);
+
+                    // One bad batch must not silently kill the monitor: report it and keep polling
+                    try
+                    {
+                        lock (_applyGate)
+                        {
+                            if (_pauseCount > 0)
+                                continue;
+
+                            _faultReportedThisPoll = false;
+                            PollAndApplyUsnBatch(hVolume, bufferPtr, batch, ct);
+                            if (!_faultReportedThisPoll)
+                                _lastFaultMessage = null;
+                        }
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        ReportFault($"USN monitor error: {ex.Message}");
+                    }
+                }
+            }
+            finally
+            {
+                FreeAlignedBuffer(bufferPtr);
             }
         }
         catch (OperationCanceledException)
         {
             // Normal shutdown
         }
-        finally
+        catch (Exception ex)
         {
-            FreeAlignedBuffer(bufferPtr);
+            ReportFault($"USN monitor stopped: {ex.Message}");
         }
     }
 
@@ -126,12 +250,11 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
     private unsafe void PollAndApplyUsnBatch(
         SafeFileHandle hVolume,
         IntPtr bufferPtr,
-        Dictionary<ulong, (ulong ParentFrn, string Name, uint CombinedReason, uint Attrs)> seenInBatch,
+        UsnBatch batch,
         CancellationToken ct)
     {
         byte* buffer = (byte*)bufferPtr;
-        seenInBatch.Clear();
-        string lastItemName = string.Empty;
+        batch.Clear();
 
         while (!ct.IsCancellationRequested)
         {
@@ -155,17 +278,26 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
                 out uint bytesReturned,
                 IntPtr.Zero))
             {
+                HandleJournalReadFailure(hVolume, Marshal.GetLastWin32Error());
                 break;
             }
 
-            if (bytesReturned <= sizeof(long))
+            // A successful read means the journal position is valid again
+            Volatile.Write(ref _rescanSignalled, 0);
+
+            if (bytesReturned < sizeof(long))
                 break;
 
             long nextUsn = *(long*)buffer;
             if (nextUsn <= _nextUsn)
                 break;
 
+            // Advance even when every new record was filtered out, so the position never lags
+            // behind the journal tail and falls off the end of the (circular) journal.
             _nextUsn = nextUsn;
+
+            if (bytesReturned == sizeof(long))
+                break;
 
             uint offset = sizeof(long);
             while (offset + sizeof(NtfsNative.USN_RECORD_V2) <= bytesReturned)
@@ -174,7 +306,11 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
                 if (rec->RecordLength == 0)
                     break;
 
+                // Skip NTFS metadata files ($MFT, $LogFile, ...) by MFT record number, not by name:
+                // legitimate "$" names (e.g. Recycle Bin $R... renames) must still be tracked.
+                ulong frn = rec->FileReferenceNumber;
                 if (rec->MajorVersion == 2 &&
+                    (frn & MftIndexMask) >= FirstUserMftIndex &&
                     rec->FileNameOffset + rec->FileNameLength <= rec->RecordLength)
                 {
                     char* namePtr = (char*)((byte*)rec + rec->FileNameOffset);
@@ -182,18 +318,23 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
                     if (charLen > 0)
                     {
                         string name = new string(namePtr, 0, charLen);
-                        // Ignore internal NTFS metadata streams ($MFT, $UsnJrnl, etc.)
-                        if (name[0] != '$')
+                        uint combinedReason = rec->Reason;
+                        if (batch.Items.TryGetValue(frn, out var prev))
                         {
-                            ulong frn = rec->FileReferenceNumber;
-                            uint combinedReason = rec->Reason;
-                            if (seenInBatch.TryGetValue(frn, out var prev))
-                            {
-                                combinedReason |= prev.CombinedReason;
-                            }
-                            seenInBatch[frn] = (rec->ParentFileReferenceNumber, name, combinedReason, rec->FileAttributes);
-                            lastItemName = name;
+                            combinedReason |= prev.CombinedReason;
                         }
+                        else
+                        {
+                            batch.Order.Add(frn);
+                        }
+                        batch.Items[frn] = new UsnBatchItem
+                        {
+                            ParentFrn = rec->ParentFileReferenceNumber,
+                            Name = name,
+                            CombinedReason = combinedReason,
+                            Attrs = rec->FileAttributes
+                        };
+                        batch.LastItemName = name;
                     }
                 }
 
@@ -201,64 +342,14 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
             }
 
             // Cap batch size so UI updates stay responsive during heavy disk writes
-            if (seenInBatch.Count >= 2000)
+            if (batch.Items.Count >= 2000)
                 break;
         }
 
-        if (seenInBatch.Count == 0)
+        if (batch.Items.Count == 0)
             return;
 
-        int appliedCount = 0;
-        foreach (var kvp in seenInBatch)
-        {
-            if (ct.IsCancellationRequested)
-                break;
-
-            ulong fileId = kvp.Key;
-            var (parentFrn, name, reason, attrs) = kvp.Value;
-
-            bool isDir = (attrs & NtfsNative.FILE_ATTRIBUTE_DIRECTORY) != 0;
-            bool isReparse = (attrs & NtfsNative.FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-            if (isDir && isReparse)
-                continue;
-
-            if ((reason & NtfsNative.USN_REASON_FILE_DELETE) != 0)
-            {
-                if (_store.ApplyUsnDelete(fileId, parentFrn, name.AsSpan()))
-                {
-                    appliedCount++;
-                }
-            }
-            else
-            {
-                long fileSize = 0;
-                if (!isDir)
-                {
-                    if (!TryGetFileSizeById(hVolume, fileId, out fileSize))
-                    {
-                        if (_store.TryGetNodeByFileId(parentFrn, out int parentNodeId))
-                        {
-                            try
-                            {
-                                string fullPath = Path.Combine(_store.GetFullPath(parentNodeId), name);
-                                var fi = new FileInfo(fullPath);
-                                if (fi.Exists)
-                                    fileSize = fi.Length;
-                            }
-                            catch
-                            {
-                                // Ignore transient file access errors
-                            }
-                        }
-                    }
-                }
-
-                if (_store.ApplyUsnCreateOrUpdate(fileId, parentFrn, name.AsSpan(), fileSize, isDir))
-                {
-                    appliedCount++;
-                }
-            }
-        }
+        int appliedCount = ApplyBatch(hVolume, batch, ct);
 
         if (appliedCount > 0)
         {
@@ -267,15 +358,253 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
             {
                 BatchEventsProcessed = appliedCount,
                 TotalEventsProcessed = total,
-                LastChangedItem = lastItemName,
+                LastChangedItem = batch.LastItemName,
                 IsUsnJournalMode = true
             });
         }
     }
 
-    private static unsafe bool TryGetFileSizeById(SafeFileHandle hVolume, ulong fileId, out long fileSize)
+    /// <summary>
+    /// Applies a batch in USN order. Items whose parent is not known yet (for example a child whose
+    /// parent folder is created later in the same batch) are retried until no further progress is made.
+    /// </summary>
+    private int ApplyBatch(SafeFileHandle hVolume, UsnBatch batch, CancellationToken ct)
     {
-        fileSize = 0;
+        int applied = 0;
+        var retry = new List<ulong>();
+
+        foreach (ulong frn in batch.Order)
+        {
+            if (ct.IsCancellationRequested)
+                return applied;
+
+            switch (ApplyBatchItem(hVolume, frn, batch.Items[frn], treatUnmappedParentAsGone: false))
+            {
+                case UsnApplyResult.Applied:
+                    applied++;
+                    break;
+                case UsnApplyResult.ParentUnmapped:
+                    retry.Add(frn);
+                    break;
+            }
+        }
+
+        while (retry.Count > 0 && !ct.IsCancellationRequested)
+        {
+            var stillUnmapped = new List<ulong>();
+            foreach (ulong frn in retry)
+            {
+                switch (ApplyBatchItem(hVolume, frn, batch.Items[frn], treatUnmappedParentAsGone: false))
+                {
+                    case UsnApplyResult.Applied:
+                        applied++;
+                        break;
+                    case UsnApplyResult.ParentUnmapped:
+                        stillUnmapped.Add(frn);
+                        break;
+                }
+            }
+
+            bool progressed = stillUnmapped.Count < retry.Count;
+            retry = stillUnmapped;
+            if (!progressed)
+                break;
+        }
+
+        // The parent never became known: tracked items were moved out of the tree, others are outside it
+        foreach (ulong frn in retry)
+        {
+            if (ct.IsCancellationRequested)
+                break;
+
+            if (ApplyBatchItem(hVolume, frn, batch.Items[frn], treatUnmappedParentAsGone: true) == UsnApplyResult.Applied)
+                applied++;
+        }
+
+        return applied;
+    }
+
+    private UsnApplyResult ApplyBatchItem(
+        SafeFileHandle hVolume,
+        ulong fileId,
+        UsnBatchItem item,
+        bool treatUnmappedParentAsGone)
+    {
+        try
+        {
+            bool isDir = (item.Attrs & NtfsNative.FILE_ATTRIBUTE_DIRECTORY) != 0;
+            bool isReparse = (item.Attrs & NtfsNative.FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+
+            // Delete wins over every other reason combined for this FRN. A skipped junction/symlink was never
+            // added, so deleting it is a no-op.
+            if ((item.CombinedReason & NtfsNative.USN_REASON_FILE_DELETE) != 0)
+            {
+                return _store.ApplyUsnDelete(fileId, item.ParentFrn, item.Name.AsSpan())
+                    ? UsnApplyResult.Applied
+                    : UsnApplyResult.Ignored;
+            }
+
+            // A name of a hard-linked file was added or removed. The record names the link it concerns; if that name
+            // is gone from disk it is dropped from the tree (the file itself lives on), otherwise it is applied
+            // below like any update. Several link changes of one FRN in a poll collapse into the last record.
+            bool linkChanged = !isDir && (item.CombinedReason & NtfsNative.USN_REASON_HARD_LINK_CHANGE) != 0;
+            if (linkChanged && !LinkNameExistsOnDisk(fileId, item))
+            {
+                return _store.ApplyUsnLinkRemoved(fileId, item.ParentFrn, item.Name.AsSpan())
+                    ? UsnApplyResult.Applied
+                    : UsnApplyResult.Ignored;
+            }
+
+            // Query by FRN first, then by path. Opened without following reparse points, so nothing is recalled.
+            using SafeFileHandle hFile = OpenNodeForQuery(hVolume, fileId, item);
+
+            // The scan skips directory symlinks/junctions only; other reparse directories (cloud placeholders) are tracked
+            if (isDir && isReparse &&
+                (!NtfsNative.TryGetReparseTag(hFile, out uint reparseTag) || NtfsNative.IsReparseTagNameSurrogate(reparseTag)))
+            {
+                return UsnApplyResult.Ignored;
+            }
+
+            long fileSize = 0;
+            bool sizeKnown = true;
+            if (!isDir)
+                sizeKnown = NtfsNative.TryGetAllocationSize(hFile, out fileSize);
+
+            // Only a rename record moves a tracked node; a record under another parent for a known FRN is
+            // otherwise one more name of a hard-linked file
+            bool isRename = (item.CombinedReason & NtfsNative.USN_REASON_RENAME_NEW_NAME) != 0;
+            return _store.ApplyUsnCreateOrUpdate(
+                fileId, item.ParentFrn, item.Name.AsSpan(), fileSize, isDir, sizeKnown, treatUnmappedParentAsGone, isRename);
+        }
+        catch (Exception ex)
+        {
+            ReportFault($"Failed to apply change to '{item.Name}': {ex.Message}. Live totals may be out of date until the next rescan.");
+            return UsnApplyResult.Ignored;
+        }
+    }
+
+    /// <summary>
+    /// Whether the file name in a hard-link-change record still exists with this FRN. True when it cannot be
+    /// checked (parent outside the tracked tree), so nothing is dropped on a guess.
+    /// </summary>
+    private bool LinkNameExistsOnDisk(ulong fileId, UsnBatchItem item)
+    {
+        if (!_store.TryGetNodeByFileId(item.ParentFrn, out int parentNodeId))
+            return true;
+
+        try
+        {
+            using SafeFileHandle h = NtfsNative.OpenForQuery(Path.Combine(_store.GetFullPath(parentNodeId), item.Name));
+            if (h.IsInvalid)
+                return false;
+            return !NtfsNative.GetFileInformationByHandle(h, out var info) || info.FileReferenceNumber == fileId;
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+    private unsafe void HandleJournalReadFailure(SafeFileHandle hVolume, int readError)
+    {
+        NtfsNative.USN_JOURNAL_DATA_V0 journal = default;
+        bool queried = NtfsNative.DeviceIoControl(
+            hVolume,
+            NtfsNative.FSCTL_QUERY_USN_JOURNAL,
+            null,
+            0,
+            &journal,
+            (uint)sizeof(NtfsNative.USN_JOURNAL_DATA_V0),
+            out _,
+            IntPtr.Zero);
+        int queryError = queried ? 0 : Marshal.GetLastWin32Error();
+
+        if (queried)
+        {
+            bool lostPosition =
+                readError == NtfsNative.ERROR_JOURNAL_ENTRY_DELETED ||
+                readError == NtfsNative.ERROR_JOURNAL_NOT_ACTIVE ||
+                journal.UsnJournalID != _journalId ||
+                _nextUsn < journal.LowestValidUsn;
+
+            if (lostPosition)
+            {
+                // Re-sync to the current journal tail; the tree itself must be rebuilt by a rescan
+                _journalId = journal.UsnJournalID;
+                _nextUsn = journal.NextUsn;
+                RaiseRescanRequired($"The NTFS change journal was reset or wrapped (Win32 error {readError})");
+                return;
+            }
+        }
+        else if (queryError == NtfsNative.ERROR_JOURNAL_NOT_ACTIVE ||
+                 readError == NtfsNative.ERROR_JOURNAL_NOT_ACTIVE ||
+                 readError == NtfsNative.ERROR_JOURNAL_ENTRY_DELETED)
+        {
+            RaiseRescanRequired($"The NTFS change journal is no longer active (Win32 error {readError})");
+            return;
+        }
+
+        ReportFault($"Reading the USN journal failed (Win32 error {readError}); will keep retrying");
+    }
+
+    private void RaiseRescanRequired(string reason)
+    {
+        // Once per episode: stays latched until a journal read succeeds again
+        if (Interlocked.Exchange(ref _rescanSignalled, 1) == 1)
+            return;
+
+        RescanRequired?.Invoke(this, reason);
+    }
+
+    private void ReportFault(string message)
+    {
+        _faultReportedThisPoll = true;
+        if (string.Equals(_lastFaultMessage, message, StringComparison.Ordinal))
+            return;
+
+        _lastFaultMessage = message;
+        StatusChanged?.Invoke(this, new UsnMonitorStatusEventArgs
+        {
+            Kind = UsnMonitorStatusKind.Fault,
+            Message = message
+        });
+    }
+
+    private void SwitchToFallback(string reason)
+    {
+        _usnActive = false;
+        StartFallbackWatcher();
+        StatusChanged?.Invoke(this, new UsnMonitorStatusEventArgs
+        {
+            Kind = UsnMonitorStatusKind.FellBackToWatcher,
+            Message = reason
+        });
+    }
+
+    /// <summary>Opens the node by file ID, or by path through its known parent; the handle is invalid if both fail.</summary>
+    private SafeFileHandle OpenNodeForQuery(SafeFileHandle hVolume, ulong fileId, UsnBatchItem item)
+    {
+        SafeFileHandle hFile = OpenFileByIdForQuery(hVolume, fileId);
+        if (!hFile.IsInvalid)
+            return hFile;
+
+        hFile.Dispose();
+        if (_store.TryGetNodeByFileId(item.ParentFrn, out int parentNodeId))
+        {
+            try
+            {
+                return NtfsNative.OpenForQuery(Path.Combine(_store.GetFullPath(parentNodeId), item.Name));
+            }
+            catch
+            {
+                // Ignore transient file access errors
+            }
+        }
+        return new SafeFileHandle(IntPtr.Zero, ownsHandle: false);
+    }
+
+    private static unsafe SafeFileHandle OpenFileByIdForQuery(SafeFileHandle hVolume, ulong fileId)
+    {
         var desc = new NtfsNative.FILE_ID_DESCRIPTOR
         {
             dwSize = (uint)sizeof(NtfsNative.FILE_ID_DESCRIPTOR),
@@ -283,19 +612,14 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
             FileId = fileId
         };
 
-        using SafeFileHandle hFile = NtfsNative.OpenFileById(
+        // FILE_FLAG_OPEN_REPARSE_POINT: query the node itself, never follow a link and never recall a cloud file
+        return NtfsNative.OpenFileById(
             hVolume,
             ref desc,
             NtfsNative.FILE_READ_ATTRIBUTES,
             NtfsNative.FILE_SHARE_ALL,
             IntPtr.Zero,
-            NtfsNative.FILE_FLAG_BACKUP_SEMANTICS);
-
-        if (!hFile.IsInvalid && NtfsNative.GetFileSizeEx(hFile, out fileSize))
-        {
-            return true;
-        }
-        return false;
+            NtfsNative.FILE_FLAG_BACKUP_SEMANTICS | NtfsNative.FILE_FLAG_OPEN_REPARSE_POINT);
     }
 
     private void StartFallbackWatcher()
@@ -305,72 +629,52 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
             _fallbackWatcher = new FileSystemWatcher(_store.RootPath)
             {
                 IncludeSubdirectories = true,
+                InternalBufferSize = 64 * 1024,
                 NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.Size
             };
 
-            _fallbackWatcher.Created += (_, e) => HandleFallbackEvent(e.FullPath, isDelete: false);
-            _fallbackWatcher.Changed += (_, e) => HandleFallbackEvent(e.FullPath, isDelete: false);
-            _fallbackWatcher.Deleted += (_, e) => HandleFallbackEvent(e.FullPath, isDelete: true);
+            _fallbackWatcher.Created += (_, e) => ApplyFallbackChange(e.FullPath, isDelete: false);
+            _fallbackWatcher.Changed += (_, e) => ApplyFallbackChange(e.FullPath, isDelete: false);
+            _fallbackWatcher.Deleted += (_, e) => ApplyFallbackChange(e.FullPath, isDelete: true);
             _fallbackWatcher.Renamed += (_, e) =>
             {
-                HandleFallbackEvent(e.OldFullPath, isDelete: true);
-                HandleFallbackEvent(e.FullPath, isDelete: false);
+                // A rename keeps the FRN, so updating the new path moves/renames the existing node (and
+                // its subtree). Deleting the old path first would tombstone that whole subtree.
+                if (GetFileIdForPath(e.FullPath) == 0)
+                    ApplyFallbackChange(e.OldFullPath, isDelete: true);
+                ApplyFallbackChange(e.FullPath, isDelete: false, isRename: true);
+            };
+            _fallbackWatcher.Error += (_, e) =>
+            {
+                Exception ex = e.GetException();
+                if (ex is InternalBufferOverflowException)
+                    RaiseRescanRequired("The file system watcher buffer overflowed and changes were lost");
+                else
+                    ReportFault($"File system watcher error: {ex.Message}");
             };
             _fallbackWatcher.EnableRaisingEvents = true;
         }
-        catch
+        catch (Exception ex)
         {
-            // Ignore if volume doesn't support FileSystemWatcher
+            ReportFault($"Live monitoring is unavailable for this volume: {ex.Message}");
         }
     }
 
-    private void HandleFallbackEvent(string fullPath, bool isDelete)
+    private void ApplyFallbackChange(string fullPath, bool isDelete, bool isRename = false)
     {
         try
         {
-            string? dirPath = Path.GetDirectoryName(fullPath);
-            string name = Path.GetFileName(fullPath);
-            if (string.IsNullOrEmpty(dirPath) || string.IsNullOrEmpty(name))
-                return;
-
-            ulong parentId = GetFileIdForPath(dirPath);
-            if (parentId == 0)
-                return;
-
-            if (isDelete)
+            int applied = HandleFallbackEvent(fullPath, isDelete, expandNewDirectory: true, isRename);
+            if (applied > 0)
             {
-                if (_store.ApplyUsnDelete(0, parentId, name.AsSpan()))
+                long total = Interlocked.Add(ref _totalEventsProcessed, applied);
+                ChangesDetected?.Invoke(this, new UsnMonitorEventArgs
                 {
-                    long total = Interlocked.Increment(ref _totalEventsProcessed);
-                    ChangesDetected?.Invoke(this, new UsnMonitorEventArgs
-                    {
-                        BatchEventsProcessed = 1,
-                        TotalEventsProcessed = total,
-                        LastChangedItem = name,
-                        IsUsnJournalMode = false
-                    });
-                }
-            }
-            else
-            {
-                ulong fileId = GetFileIdForPath(fullPath);
-                bool isDir = Directory.Exists(fullPath);
-                long size = 0;
-                if (!isDir && File.Exists(fullPath))
-                {
-                    size = new FileInfo(fullPath).Length;
-                }
-                if (_store.ApplyUsnCreateOrUpdate(fileId, parentId, name.AsSpan(), size, isDir))
-                {
-                    long total = Interlocked.Increment(ref _totalEventsProcessed);
-                    ChangesDetected?.Invoke(this, new UsnMonitorEventArgs
-                    {
-                        BatchEventsProcessed = 1,
-                        TotalEventsProcessed = total,
-                        LastChangedItem = name,
-                        IsUsnJournalMode = false
-                    });
-                }
+                    BatchEventsProcessed = applied,
+                    TotalEventsProcessed = total,
+                    LastChangedItem = Path.GetFileName(fullPath),
+                    IsUsnJournalMode = false
+                });
             }
         }
         catch
@@ -379,16 +683,129 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         }
     }
 
+    /// <summary>Applies one watcher event to the store and returns the number of store changes made.</summary>
+    private int HandleFallbackEvent(string fullPath, bool isDelete, bool expandNewDirectory, bool isRename = false)
+    {
+        string? dirPath = Path.GetDirectoryName(fullPath);
+        string name = Path.GetFileName(fullPath);
+        if (string.IsNullOrEmpty(dirPath) || string.IsNullOrEmpty(name))
+            return 0;
+
+        ulong parentId = GetFileIdForPath(dirPath);
+        if (parentId == 0)
+            return 0;
+
+        if (isDelete)
+        {
+            return _store.ApplyUsnDelete(0, parentId, name.AsSpan()) ? 1 : 0;
+        }
+
+        // One handle gives identity, kind, reparse tag and size on disk; it does not follow links or recall cloud files
+        using SafeFileHandle h = NtfsNative.OpenForQuery(fullPath);
+        if (h.IsInvalid || !NtfsNative.GetFileInformationByHandle(h, out var info))
+            return 0; // already gone (or unreadable); a Deleted event will follow
+
+        ulong fileId = info.FileReferenceNumber;
+        if (fileId == 0)
+            return 0;
+
+        bool isDir = (info.FileAttributes & NtfsNative.FILE_ATTRIBUTE_DIRECTORY) != 0;
+        bool isReparse = (info.FileAttributes & NtfsNative.FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+
+        // Same rule as the scan: directory symlinks/junctions are not tracked
+        if (isDir && isReparse &&
+            (!NtfsNative.TryGetReparseTag(h, out uint reparseTag) || NtfsNative.IsReparseTagNameSurrogate(reparseTag)))
+        {
+            return 0;
+        }
+
+        long size = 0;
+        bool sizeKnown = true;
+        if (!isDir)
+            sizeKnown = NtfsNative.TryGetAllocationSize(h, out size);
+
+        bool wasKnown = _store.TryGetNodeByFileId(fileId, out _);
+        if (_store.ApplyUsnCreateOrUpdate(fileId, parentId, name.AsSpan(), size, isDir, sizeKnown, isRename: isRename) != UsnApplyResult.Applied)
+            return 0;
+
+        int applied = 1;
+        if (isDir && expandNewDirectory && !wasKnown)
+        {
+            // A junction is created as a plain directory first and turned into a link a moment later, so the
+            // check above can have seen the empty directory: take it out again rather than walk through the link.
+            if (IsNameSurrogateDirectory(fullPath))
+            {
+                _store.ApplyUsnDelete(fileId, parentId, name.AsSpan());
+                return 0;
+            }
+            applied += AddNewDirectoryContents(fullPath);
+        }
+        return applied;
+    }
+
+    /// <summary>
+    /// A directory created or moved into the tree raises a single watcher event for the directory itself.
+    /// Cheap, bounded best effort: add what is inside it now (directory symlinks/junctions are skipped, as in the scan).
+    /// </summary>
+    private int AddNewDirectoryContents(string dirPath)
+    {
+        int applied = 0;
+        int visited = 0;
+        var options = new EnumerationOptions
+        {
+            IgnoreInaccessible = true,
+            AttributesToSkip = 0
+        };
+
+        // Walk by hand so a directory symlink/junction is never entered; HandleFallbackEvent applies the same
+        // tag check and returns 0 for them.
+        var pending = new Stack<string>();
+        pending.Push(dirPath);
+        while (pending.Count > 0)
+        {
+            string current = pending.Pop();
+            try
+            {
+                var entries = new FileSystemEnumerable<(string Path, bool IsDirectory)>(
+                    current,
+                    (ref FileSystemEntry e) => (e.ToFullPath(), e.IsDirectory),
+                    options);
+
+                foreach ((string path, bool isDirectory) in entries)
+                {
+                    if (++visited > MaxFallbackDirectoryEntries)
+                    {
+                        ReportFault($"'{Path.GetFileName(dirPath)}' contains more than {MaxFallbackDirectoryEntries:N0} items; the rest are not tracked until the next rescan");
+                        return applied;
+                    }
+
+                    applied += HandleFallbackEvent(path, isDelete: false, expandNewDirectory: false);
+                    if (isDirectory && !IsNameSurrogateDirectory(path))
+                        pending.Push(path);
+                }
+            }
+            catch
+            {
+                // Ignore transient errors (directory may already be gone)
+            }
+        }
+        return applied;
+    }
+
+    /// <summary>True for a directory symlink or junction (also when it cannot be queried, to stay on the safe side).</summary>
+    private static bool IsNameSurrogateDirectory(string path)
+    {
+        using SafeFileHandle h = NtfsNative.OpenForQuery(path);
+        if (h.IsInvalid || !NtfsNative.GetFileInformationByHandle(h, out var info))
+            return true;
+
+        return (info.FileAttributes & NtfsNative.FILE_ATTRIBUTE_REPARSE_POINT) != 0 &&
+               (!NtfsNative.TryGetReparseTag(h, out uint tag) || NtfsNative.IsReparseTagNameSurrogate(tag));
+    }
+
     private static ulong GetFileIdForPath(string path)
     {
-        using SafeFileHandle h = NtfsNative.CreateFileW(
-            path,
-            NtfsNative.FILE_READ_ATTRIBUTES,
-            NtfsNative.FILE_SHARE_ALL,
-            IntPtr.Zero,
-            NtfsNative.OPEN_EXISTING,
-            NtfsNative.FILE_FLAG_BACKUP_SEMANTICS,
-            IntPtr.Zero);
+        using SafeFileHandle h = NtfsNative.OpenForQuery(path);
 
         if (!h.IsInvalid && NtfsNative.GetFileInformationByHandle(h, out var info))
         {

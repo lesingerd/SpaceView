@@ -6,6 +6,16 @@ using System.Text;
 
 namespace SpaceView.Core;
 
+public enum UsnApplyResult
+{
+    /// <summary>Nothing to change (item outside the tracked tree, or already up to date).</summary>
+    Ignored,
+    /// <summary>The store was modified.</summary>
+    Applied,
+    /// <summary>The parent is not (yet) known; the caller may retry once other records have been applied.</summary>
+    ParentUnmapped
+}
+
 [StructLayout(LayoutKind.Sequential, Pack = 4)]
 public struct NodeRecord
 {
@@ -34,6 +44,32 @@ public struct NodeRecord
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get => (Flags & FlagDeleted) != 0;
+    }
+}
+
+/// <summary>A consistent copy of one node's display data, read under a single store lock.</summary>
+public readonly struct NodeSnapshot
+{
+    public readonly int NodeId;
+    public readonly int ParentId;
+    public readonly bool IsDirectory;
+    public readonly string Name;
+    public readonly long Size;
+    public readonly int FileCount;
+    public readonly int FolderCount;
+    /// <summary>Size of the parent directory (0 for the root); the denominator for the node's percentage.</summary>
+    public readonly long ParentSize;
+
+    public NodeSnapshot(int nodeId, in NodeRecord rec, string name, long parentSize)
+    {
+        NodeId = nodeId;
+        ParentId = rec.ParentId;
+        IsDirectory = rec.IsDirectory;
+        Name = name;
+        Size = rec.Size;
+        FileCount = rec.FileCount;
+        FolderCount = rec.FolderCount;
+        ParentSize = parentSize;
     }
 }
 
@@ -68,10 +104,49 @@ public sealed class FileSystemStore
     private readonly int[]?[] _mftPages = new int[MaxPagedMftIndex >> MftPageShift][];
     private readonly Dictionary<ulong, int> _overflowFrnMap = new();
 
+    // Hard links: a file with several names has one node per name, all with the same FRN. Exactly one of them (the
+    // "carrier", the node the FRN map points at) holds the size; the other links have size 0 so the file is counted once.
+    // Only files with two or more nodes have an entry (FRN -> every node of the file, carrier included, possibly
+    // tombstoned ones that are skipped on use).
+    private readonly Dictionary<ulong, List<int>> _linkGroups = new();
+
     public string RootPath { get; }
     public int RootNodeId => 0;
 
     public int TotalNodeCount => Volatile.Read(ref _nodeCount);
+
+    /// <summary>
+    /// A cheap estimate of the memory held by the store: the allocated node chunks, name slabs and FRN pages, plus a rough
+    /// per-entry cost for the two dictionaries. It counts allocated arrays, not live nodes.
+    /// </summary>
+    public long EstimatedMemoryBytes
+    {
+        get
+        {
+            lock (_syncLock)
+            {
+                long chunks = 0;
+                foreach (NodeRecord[] chunk in _chunks)
+                {
+                    if (chunk != null)
+                        chunks++;
+                }
+
+                long pages = 0;
+                foreach (int[]? page in _mftPages)
+                {
+                    if (page != null)
+                        pages++;
+                }
+
+                return chunks * ChunkSize * Unsafe.SizeOf<NodeRecord>() +
+                       _nameSlabs.Count * (long)NameSlabSize +
+                       pages * MftPageSize * sizeof(int) +
+                       _overflowFrnMap.Count * 40L +
+                       _linkGroups.Count * 96L;
+            }
+        }
+    }
     public object SyncRoot => _syncLock;
 
     public FileSystemStore(string rootPath, ulong rootFileId = 0)
@@ -105,17 +180,13 @@ public sealed class FileSystemStore
     {
         lock (_syncLock)
         {
-            int nodeId = AddNodeInternal(parentId, name, size, fileId, isDirectory);
+            int nodeId = AddAndMapNodeUnsafe(parentId, name, size, fileId, isDirectory);
             if (linkToParent && parentId >= 0)
             {
                 ref NodeRecord parent = ref GetNodeRef(parentId);
                 ref NodeRecord child = ref GetNodeRef(nodeId);
                 child.NextSiblingId = parent.FirstChildId;
                 parent.FirstChildId = nodeId;
-            }
-            if (fileId != 0)
-            {
-                MapFileIdInternal(fileId, nodeId);
             }
             return nodeId;
         }
@@ -142,17 +213,12 @@ public sealed class FileSystemStore
             for (int i = 0; i < entries.Length; i++)
             {
                 ref readonly PendingChildEntry entry = ref entries[i];
-                int nodeId = AddNodeInternal(parentId, entry.Name.AsSpan(), entry.Size, entry.FileId, entry.IsDirectory);
+                int nodeId = AddAndMapNodeUnsafe(parentId, entry.Name.AsSpan(), entry.Size, entry.FileId, entry.IsDirectory);
 
                 // Re-fetch parent ref in case _chunks grew
                 ref NodeRecord child = ref GetNodeRef(nodeId);
                 child.NextSiblingId = firstChild;
                 firstChild = nodeId;
-
-                if (entry.FileId != 0)
-                {
-                    MapFileIdInternal(entry.FileId, nodeId);
-                }
 
                 if (entry.IsDirectory)
                 {
@@ -162,6 +228,87 @@ public sealed class FileSystemStore
 
             GetNodeRef(parentId).FirstChildId = firstChild;
         }
+    }
+
+    /// <summary>
+    /// Adds a node and maps its FRN. A file whose FRN already belongs to a live, different file node is another hard
+    /// link to that file: it is added with size 0 (the carrier already counts the size) and left out of the FRN map,
+    /// which keeps pointing at the carrier. The caller links the node into its parent.
+    /// </summary>
+    private int AddAndMapNodeUnsafe(int parentId, ReadOnlySpan<char> name, long size, ulong fileId, bool isDirectory)
+    {
+        bool isExtraLink = TryGetLinkCarrierUnsafe(fileId, isDirectory, out int carrierId);
+        int nodeId = AddNodeInternal(parentId, name, isExtraLink ? 0 : size, fileId, isDirectory);
+        if (isExtraLink)
+            RegisterLinkUnsafe(fileId, carrierId, nodeId);
+        else if (fileId != 0)
+            MapFileIdInternal(fileId, nodeId);
+        return nodeId;
+    }
+
+    /// <summary>True if the FRN is already mapped to a live file node with the very same FRN (not just the same MFT slot).</summary>
+    private bool TryGetLinkCarrierUnsafe(ulong fileId, bool isDirectory, out int carrierId)
+    {
+        carrierId = -1;
+        if (fileId == 0 || isDirectory || !TryGetNodeByFileIdUnsafe(fileId, out int mapped))
+            return false;
+
+        ref NodeRecord m = ref GetNodeRef(mapped);
+        if (m.IsDirectory || m.FileId != fileId)
+            return false;
+
+        carrierId = mapped;
+        return true;
+    }
+
+    private void RegisterLinkUnsafe(ulong fileId, int carrierId, int linkId)
+    {
+        if (!_linkGroups.TryGetValue(fileId, out List<int>? group))
+        {
+            group = new List<int>(2) { carrierId };
+            _linkGroups[fileId] = group;
+        }
+        else if (!group.Contains(carrierId))
+        {
+            group.Add(carrierId);
+        }
+        group.Add(linkId);
+    }
+
+    /// <summary>
+    /// Called before a file node is tombstoned. Takes it out of its link group and, if it was the carrier and the file
+    /// has other live names, hands the size (and the FRN map slot) to one of them so the file stays counted once.
+    /// The caller removes the node's own size from its ancestors.
+    /// </summary>
+    private void ReleaseLinkUnsafe(int nodeId)
+    {
+        ref NodeRecord rec = ref GetNodeRef(nodeId);
+        ulong fileId = rec.FileId;
+        if (rec.IsDirectory || fileId == 0 || !_linkGroups.TryGetValue(fileId, out List<int>? group))
+            return;
+
+        bool wasCarrier = TryGetNodeByFileIdUnsafe(fileId, out int carrierId) && carrierId == nodeId;
+        group.RemoveAll(id => id == nodeId || GetNodeRef(id).IsDeleted || GetNodeRef(id).FileId != fileId);
+
+        if (wasCarrier && group.Count > 0)
+        {
+            int heirId = group[0];
+            long size = rec.Size;
+            GetNodeRef(heirId).Size = size;
+            MapFileIdInternal(fileId, heirId);
+            if (size != 0)
+                PropagateDeltaUnsafe(GetNodeRef(heirId).ParentId, size, 0, 0);
+        }
+
+        if (group.Count < 2)
+            _linkGroups.Remove(fileId);
+    }
+
+    /// <summary>Finds the live child of <paramref name="parentId"/> that is the name <paramref name="name"/> of file <paramref name="fileId"/>, or -1.</summary>
+    private int FindLinkByNameUnsafe(int parentId, ReadOnlySpan<char> name, ulong fileId)
+    {
+        int childId = FindChildByNameUnsafe(parentId, name);
+        return childId > 0 && GetNodeRef(childId).FileId == fileId ? childId : -1;
     }
 
     private int AddNodeInternal(int parentId, ReadOnlySpan<char> name, long size, ulong fileId, bool isDirectory)
@@ -293,8 +440,31 @@ public sealed class FileSystemStore
         return Path.Combine(RootPath, string.Join(Path.DirectorySeparatorChar, parts));
     }
 
+    private void UnmapFileIdInternal(ulong fileId, int nodeId)
+    {
+        if (fileId == 0)
+            return;
+
+        ulong mftIndex = fileId & 0x0000FFFFFFFFFFFFUL;
+        if (mftIndex < MaxPagedMftIndex)
+        {
+            int[]? page = _mftPages[(int)(mftIndex >> MftPageShift)];
+            int offset = (int)(mftIndex & MftPageMask);
+            // Only clear the slot if it still points at this node (it may already belong to a newer file)
+            if (page != null && page[offset] == nodeId + 1)
+                page[offset] = 0;
+        }
+        else if (_overflowFrnMap.TryGetValue(fileId, out int found) && found == nodeId)
+        {
+            _overflowFrnMap.Remove(fileId);
+        }
+    }
+
     private void MapFileIdInternal(ulong fileId, int nodeId)
     {
+        if (fileId == 0)
+            return;
+
         ulong mftIndex = fileId & 0x0000FFFFFFFFFFFFUL;
         if (mftIndex < MaxPagedMftIndex)
         {
@@ -324,35 +494,38 @@ public sealed class FileSystemStore
 
     private bool TryGetNodeByFileIdUnsafe(ulong fileId, out int nodeId)
     {
+        if (TryGetMappedNodeUnsafe(fileId, out nodeId) && !GetNodeRef(nodeId).IsDeleted)
+            return true;
+
+        nodeId = -1;
+        return false;
+    }
+
+    /// <summary>The node the FRN map points at, live or tombstoned.</summary>
+    private bool TryGetMappedNodeUnsafe(ulong fileId, out int nodeId)
+    {
+        nodeId = -1;
         if (fileId == 0)
-        {
-            nodeId = -1;
             return false;
-        }
 
         ulong mftIndex = fileId & 0x0000FFFFFFFFFFFFUL;
         if (mftIndex < MaxPagedMftIndex)
         {
-            int pageIdx = (int)(mftIndex >> MftPageShift);
-            int[]? page = _mftPages[pageIdx];
-            if (page != null)
+            int[]? page = _mftPages[(int)(mftIndex >> MftPageShift)];
+            int val = page != null ? page[(int)(mftIndex & MftPageMask)] : 0;
+            if (val > 0)
             {
-                int val = page[(int)(mftIndex & MftPageMask)];
-                if (val > 0)
-                {
-                    nodeId = val - 1;
-                    if (!GetNodeRef(nodeId).IsDeleted)
-                        return true;
-                }
+                nodeId = val - 1;
+                return true;
             }
+            return false;
         }
-        else if (_overflowFrnMap.TryGetValue(fileId, out int found) && !GetNodeRef(found).IsDeleted)
+
+        if (_overflowFrnMap.TryGetValue(fileId, out int found))
         {
             nodeId = found;
             return true;
         }
-
-        nodeId = -1;
         return false;
     }
 
@@ -367,66 +540,72 @@ public sealed class FileSystemStore
             if (_nodeCount == 0)
                 return;
 
-            // Collect all directories in BFS/DFS order from root, then process in reverse (bottom-up)!
-            var dirOrder = new List<int>(Math.Max(1024, _nodeCount / 8));
-            var stack = new Stack<int>(256);
-            stack.Push(0);
+            ComputeTotalsUnsafe(0);
+        }
+    }
 
-            while (stack.Count > 0)
+    /// <summary>Recomputes the totals of directory <paramref name="rootDirId"/> and every live directory below it. The ancestors are not touched.</summary>
+    private void ComputeTotalsUnsafe(int rootDirId)
+    {
+        // Collect all directories in BFS/DFS order from the start directory, then process in reverse (bottom-up)!
+        var dirOrder = new List<int>(Math.Max(1024, _nodeCount / 8));
+        var stack = new Stack<int>(256);
+        stack.Push(rootDirId);
+
+        while (stack.Count > 0)
+        {
+            int dirId = stack.Pop();
+            dirOrder.Add(dirId);
+
+            ref NodeRecord dirRec = ref GetNodeRef(dirId);
+            dirRec.Size = 0;
+            dirRec.FileCount = 0;
+            dirRec.FolderCount = 0;
+
+            int childId = dirRec.FirstChildId;
+            while (childId != -1)
             {
-                int dirId = stack.Pop();
-                dirOrder.Add(dirId);
-
-                ref NodeRecord dirRec = ref GetNodeRef(dirId);
-                dirRec.Size = 0;
-                dirRec.FileCount = 0;
-                dirRec.FolderCount = 0;
-
-                int childId = dirRec.FirstChildId;
-                while (childId != -1)
+                ref NodeRecord child = ref GetNodeRef(childId);
+                if (!child.IsDeleted && child.IsDirectory)
                 {
-                    ref NodeRecord child = ref GetNodeRef(childId);
-                    if (!child.IsDeleted && child.IsDirectory)
-                    {
-                        stack.Push(childId);
-                    }
-                    childId = child.NextSiblingId;
+                    stack.Push(childId);
                 }
+                childId = child.NextSiblingId;
+            }
+        }
+
+        // Reverse order guarantees every child directory is totaled before its parent directory!
+        for (int i = dirOrder.Count - 1; i >= 0; i--)
+        {
+            int dirId = dirOrder[i];
+            long totalSize = 0;
+            int totalFiles = 0;
+            int totalFolders = 0;
+
+            int childId = GetNodeRef(dirId).FirstChildId;
+            while (childId != -1)
+            {
+                ref NodeRecord child = ref GetNodeRef(childId);
+                if (!child.IsDeleted)
+                {
+                    totalSize += child.Size;
+                    if (child.IsDirectory)
+                    {
+                        totalFolders += 1 + child.FolderCount;
+                        totalFiles += child.FileCount;
+                    }
+                    else
+                    {
+                        totalFiles += 1;
+                    }
+                }
+                childId = child.NextSiblingId;
             }
 
-            // Reverse order guarantees every child directory is totaled before its parent directory!
-            for (int i = dirOrder.Count - 1; i >= 0; i--)
-            {
-                int dirId = dirOrder[i];
-                long totalSize = 0;
-                int totalFiles = 0;
-                int totalFolders = 0;
-
-                int childId = GetNodeRef(dirId).FirstChildId;
-                while (childId != -1)
-                {
-                    ref NodeRecord child = ref GetNodeRef(childId);
-                    if (!child.IsDeleted)
-                    {
-                        totalSize += child.Size;
-                        if (child.IsDirectory)
-                        {
-                            totalFolders += 1 + child.FolderCount;
-                            totalFiles += child.FileCount;
-                        }
-                        else
-                        {
-                            totalFiles += 1;
-                        }
-                    }
-                    childId = child.NextSiblingId;
-                }
-
-                ref NodeRecord dir = ref GetNodeRef(dirId);
-                dir.Size = totalSize;
-                dir.FileCount = totalFiles;
-                dir.FolderCount = totalFolders;
-            }
+            ref NodeRecord dir = ref GetNodeRef(dirId);
+            dir.Size = totalSize;
+            dir.FileCount = totalFiles;
+            dir.FolderCount = totalFolders;
         }
     }
 
@@ -484,30 +663,148 @@ public sealed class FileSystemStore
         }
     }
 
+    /// <summary>Name, totals and parent size of one node under a single lock (the root's name is its path).</summary>
+    public NodeSnapshot GetNodeInfo(int nodeId)
+    {
+        lock (_syncLock)
+        {
+            return GetNodeInfoUnsafe(nodeId);
+        }
+    }
+
+    private NodeSnapshot GetNodeInfoUnsafe(int nodeId)
+    {
+        ref NodeRecord rec = ref GetNodeRef(nodeId);
+        string name = nodeId == 0 ? RootPath : GetNameUnsafe(nodeId);
+        long parentSize = rec.ParentId >= 0 ? GetNodeRef(rec.ParentId).Size : 0;
+        return new NodeSnapshot(nodeId, rec, name, parentSize);
+    }
+
+    private sealed class ChildOrder : IComparer<(long Size, int Id)>
+    {
+        public static readonly ChildOrder Instance = new();
+
+        // Largest first; equal sizes by node id so that consecutive pages never overlap or leave gaps
+        public int Compare((long Size, int Id) x, (long Size, int Id) y)
+        {
+            int bySize = y.Size.CompareTo(x.Size);
+            return bySize != 0 ? bySize : x.Id.CompareTo(y.Id);
+        }
+    }
+
+    /// <summary>
+    /// Appends up to <paramref name="take"/> live children of a directory to <paramref name="results"/>, largest first,
+    /// starting at rank <paramref name="skip"/>, with everything the UI needs for a row (name, totals, parent size),
+    /// all read under one lock. Returns the total number of live children, so the caller knows how many are left.
+    /// The sort covers all children and happens under the lock; for millions of entries call it off the UI thread.
+    /// </summary>
+    public int GetChildPage(int parentId, int skip, int take, List<NodeSnapshot> results)
+    {
+        lock (_syncLock)
+        {
+            ref NodeRecord parent = ref GetNodeRef(parentId);
+            long parentSize = parent.Size;
+
+            int count = 0;
+            for (int c = parent.FirstChildId; c != -1; c = GetNodeRef(c).NextSiblingId)
+            {
+                if (!GetNodeRef(c).IsDeleted)
+                    count++;
+            }
+
+            if (count == 0 || take <= 0 || skip >= count)
+                return count;
+
+            var entries = ArrayPool<(long Size, int Id)>.Shared.Rent(count);
+            try
+            {
+                int idx = 0;
+                for (int c = parent.FirstChildId; c != -1; c = GetNodeRef(c).NextSiblingId)
+                {
+                    ref NodeRecord rec = ref GetNodeRef(c);
+                    if (!rec.IsDeleted)
+                        entries[idx++] = (rec.Size, c);
+                }
+
+                Array.Sort(entries, 0, count, ChildOrder.Instance);
+
+                int end = (int)Math.Min((long)count, (long)skip + take);
+                for (int i = Math.Max(0, skip); i < end; i++)
+                {
+                    int id = entries[i].Id;
+                    results.Add(new NodeSnapshot(id, GetNodeRef(id), GetNameUnsafe(id), parentSize));
+                }
+                return count;
+            }
+            finally
+            {
+                ArrayPool<(long Size, int Id)>.Shared.Return(entries);
+            }
+        }
+    }
+
     // =========================================================================
     // Real-time NTFS USN Journal Incremental Mutation Operations
     // =========================================================================
 
-    public bool ApplyUsnCreateOrUpdate(
+    public UsnApplyResult ApplyUsnCreateOrUpdate(
         ulong fileId,
         ulong parentFileId,
         ReadOnlySpan<char> fileName,
         long newFileSize,
-        bool isDirectory)
+        bool isDirectory,
+        bool sizeKnown = true,
+        bool treatUnmappedParentAsGone = true,
+        bool isRename = true)
     {
         lock (_syncLock)
         {
             if (TryGetNodeByFileIdUnsafe(fileId, out int existingNodeId))
             {
                 ref NodeRecord existing = ref GetNodeRef(existingNodeId);
+                bool parentKnown = TryGetNodeByFileIdUnsafe(parentFileId, out int newParentId);
 
+                // The FRN is shared by every name of a hard-linked file, so a record for a name other than the
+                // carrier's is not a move unless it says so (isRename). The size lives on the carrier only.
+                // A rename of one name of a file that has several is indistinguishable from a new link here: the
+                // new name is added and the old one stays until the next rescan.
+                bool linkRecord = !isDirectory && (!isRename || _linkGroups.ContainsKey(fileId));
+                if (linkRecord)
+                {
+                    bool isCarrierName = parentKnown && newParentId == existing.ParentId &&
+                                         (fileName.IsEmpty || NameEqualsUnsafe(existingNodeId, fileName));
+                    if (parentKnown && !isCarrierName && !fileName.IsEmpty &&
+                        FindLinkByNameUnsafe(newParentId, fileName, fileId) < 0)
+                    {
+                        int linkId = AddNodeInternal(newParentId, fileName, 0, fileId, isDirectory: false);
+                        ref NodeRecord parentRec = ref GetNodeRef(newParentId);
+                        GetNodeRef(linkId).NextSiblingId = parentRec.FirstChildId;
+                        parentRec.FirstChildId = linkId;
+                        RegisterLinkUnsafe(fileId, existingNodeId, linkId);
+                        PropagateDeltaUnsafe(newParentId, 0, 1, 0);
+                    }
+                    // else: the name is already tracked, or it lives outside the tracked tree
+                }
                 // Check if renamed or moved to a different parent
-                if (TryGetNodeByFileIdUnsafe(parentFileId, out int newParentId) && newParentId != existing.ParentId)
+                else if (!parentKnown)
+                {
+                    // An unmapped parent is only a problem if it is not the parent the node already has
+                    if (existing.ParentId >= 0 && GetNodeRef(existing.ParentId).FileId != parentFileId)
+                    {
+                        if (!treatUnmappedParentAsGone)
+                            return UsnApplyResult.ParentUnmapped;
+
+                        // Moved out of the tracked tree: it no longer counts here
+                        DeleteNodeUnsafe(existingNodeId);
+                        return UsnApplyResult.Applied;
+                    }
+                }
+                else if (newParentId != existing.ParentId)
                 {
                     MoveNodeParentUnsafe(existingNodeId, newParentId);
                 }
 
-                if (!fileName.IsEmpty && !NameEqualsUnsafe(existingNodeId, fileName))
+                if (!linkRecord && !fileName.IsEmpty && !NameEqualsUnsafe(existingNodeId, fileName))
                 {
                     int newHandle = WriteNameUtf8(fileName, out ushort byteLen);
                     ref NodeRecord recAfterWrite = ref GetNodeRef(existingNodeId);
@@ -515,7 +812,8 @@ public sealed class FileSystemStore
                     recAfterWrite.NameByteLength = byteLen;
                 }
 
-                if (!isDirectory)
+                // A failed size read must not zero the node: keep the old size
+                if (!isDirectory && sizeKnown)
                 {
                     ref NodeRecord fileRec = ref GetNodeRef(existingNodeId);
                     long sizeDelta = newFileSize - fileRec.Size;
@@ -525,32 +823,39 @@ public sealed class FileSystemStore
                         PropagateDeltaUnsafe(fileRec.ParentId, sizeDelta, 0, 0);
                     }
                 }
-                return true;
+                return UsnApplyResult.Applied;
             }
             else
             {
                 // Newly created file or folder
                 if (!TryGetNodeByFileIdUnsafe(parentFileId, out int parentNodeId))
-                    return false;
+                    return UsnApplyResult.ParentUnmapped;
 
                 // Check if a child with the same name already exists under parentNodeId
+                // (atomic-save pattern: a temp file with a new FRN replaces the old file name)
                 int existingByName = FindChildByNameUnsafe(parentNodeId, fileName);
                 if (existingByName != -1)
                 {
-                    MapFileIdInternal(fileId, existingByName);
                     ref NodeRecord rec = ref GetNodeRef(existingByName);
+
+                    // Retire the old FRN before mapping the new one so the old file delete
+                    // record can no longer resolve to this live node.
+                    UnmapFileIdInternal(rec.FileId, existingByName);
                     rec.FileId = fileId;
-                    if (!isDirectory)
+                    MapFileIdInternal(fileId, existingByName);
+
+                    if (!isDirectory && sizeKnown)
                     {
                         long delta = newFileSize - rec.Size;
                         rec.Size = newFileSize;
                         if (delta != 0)
                             PropagateDeltaUnsafe(parentNodeId, delta, 0, 0);
                     }
-                    return true;
+                    return UsnApplyResult.Applied;
                 }
 
-                int nodeId = AddNodeInternal(parentNodeId, fileName, isDirectory ? 0 : newFileSize, fileId, isDirectory);
+                long initialSize = isDirectory || !sizeKnown ? 0 : newFileSize;
+                int nodeId = AddNodeInternal(parentNodeId, fileName, initialSize, fileId, isDirectory);
                 ref NodeRecord parent = ref GetNodeRef(parentNodeId);
                 ref NodeRecord child = ref GetNodeRef(nodeId);
                 child.NextSiblingId = parent.FirstChildId;
@@ -561,11 +866,11 @@ public sealed class FileSystemStore
 
                 PropagateDeltaUnsafe(
                     parentNodeId,
-                    isDirectory ? 0 : newFileSize,
+                    initialSize,
                     isDirectory ? 0 : 1,
                     isDirectory ? 1 : 0);
 
-                return true;
+                return UsnApplyResult.Applied;
             }
         }
     }
@@ -575,18 +880,63 @@ public sealed class FileSystemStore
         lock (_syncLock)
         {
             int targetNodeId = -1;
-            if (!TryGetNodeByFileIdUnsafe(fileId, out targetNodeId))
+            if (TryGetNodeByFileIdUnsafe(fileId, out int mappedNodeId))
             {
-                if (TryGetNodeByFileIdUnsafe(parentFileId, out int parentId))
+                // The map only keys on the MFT index: make sure this really is the file being deleted
+                ulong storedId = GetNodeRef(mappedNodeId).FileId;
+                if (storedId != 0 && storedId != fileId)
+                    return false;
+                targetNodeId = mappedNodeId;
+            }
+            else if (TryGetNodeByFileIdUnsafe(parentFileId, out int parentId))
+            {
+                int byName = FindChildByNameUnsafe(parentId, fileName);
+                if (byName > 0)
                 {
-                    targetNodeId = FindChildByNameUnsafe(parentId, fileName);
+                    // Never let a stale delete (old FRN) remove a node that has since been
+                    // re-bound to a different FRN, e.g. by an atomic save.
+                    ulong storedId = GetNodeRef(byName).FileId;
+                    if (fileId == 0 || storedId == 0 || storedId == fileId)
+                        targetNodeId = byName;
                 }
             }
 
             if (targetNodeId <= 0)
                 return false;
 
+            // A delete record by FRN means the file itself is gone, so every name of a hard-linked file goes
+            // (the extra links first, so the carrier has no heir to hand its size to)
+            ulong targetFileId = GetNodeRef(targetNodeId).FileId;
+            if (fileId != 0 && targetFileId != 0 && _linkGroups.TryGetValue(targetFileId, out List<int>? group))
+            {
+                foreach (int linkId in group.ToArray())
+                {
+                    if (linkId != targetNodeId && !GetNodeRef(linkId).IsDeleted && GetNodeRef(linkId).FileId == targetFileId)
+                        DeleteNodeUnsafe(linkId);
+                }
+            }
+
             DeleteNodeUnsafe(targetNodeId);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// One name of a hard-linked file was removed while the file lives on. Drops that name's node (the size stays
+    /// counted once: a carrier hands it to one of the remaining names). Returns false if the name is not tracked.
+    /// </summary>
+    public bool ApplyUsnLinkRemoved(ulong fileId, ulong parentFileId, ReadOnlySpan<char> fileName)
+    {
+        lock (_syncLock)
+        {
+            if (!TryGetNodeByFileIdUnsafe(parentFileId, out int parentId))
+                return false;
+
+            int linkId = FindLinkByNameUnsafe(parentId, fileName, fileId);
+            if (linkId <= 0)
+                return false;
+
+            DeleteNodeUnsafe(linkId);
             return true;
         }
     }
@@ -608,12 +958,281 @@ public sealed class FileSystemStore
         if (rec.IsDeleted)
             return;
 
-        rec.Flags |= NodeRecord.FlagDeleted;
+        // The node totals already exclude anything deleted earlier, so propagate exactly once
         long removedSize = rec.Size;
         int removedFiles = rec.IsDirectory ? rec.FileCount : 1;
         int removedFolders = rec.IsDirectory ? (1 + rec.FolderCount) : 0;
+        int parentId = rec.ParentId;
 
-        PropagateDeltaUnsafe(rec.ParentId, -removedSize, -removedFiles, -removedFolders);
+        // If this name carries the size of a hard-linked file that has other names, one of them takes it over.
+        // (A carrier lost inside a deleted subtree is not handed over here: the file stays under-counted until a
+        // branch refresh or rescan.)
+        if (!rec.IsDirectory)
+            ReleaseLinkUnsafe(nodeId);
+
+        TombstoneSubtreeUnsafe(nodeId);
+
+        PropagateDeltaUnsafe(parentId, -removedSize, -removedFiles, -removedFolders);
+    }
+
+    /// <summary>
+    /// Flags a node and every live descendant as deleted (iteratively, no recursion). Deleted nodes are
+    /// unresolvable by FRN, so later events for any of them cannot propagate deltas a second time.
+    /// Does not touch ancestor totals; callers propagate the delta themselves.
+    /// Already-deleted descendants (and their subtrees) are skipped. With includeRoot false only the
+    /// descendants are tombstoned.
+    /// </summary>
+    private void TombstoneSubtreeUnsafe(int nodeId, bool includeRoot = true)
+    {
+        var stack = new Stack<int>(64);
+        stack.Push(nodeId);
+
+        while (stack.Count > 0)
+        {
+            int id = stack.Pop();
+            ref NodeRecord rec = ref GetNodeRef(id);
+            if (rec.IsDeleted)
+                continue;
+
+            if (id != nodeId || includeRoot)
+                rec.Flags |= NodeRecord.FlagDeleted;
+
+            int childId = rec.FirstChildId;
+            while (childId != -1)
+            {
+                ref NodeRecord child = ref GetNodeRef(childId);
+                if (!child.IsDeleted)
+                    stack.Push(childId);
+                childId = child.NextSiblingId;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Replaces everything below directory <paramref name="dirNodeId"/> with the contents of a freshly scanned
+    /// <paramref name="scratch"/> store (whose root node is that directory) and applies the change in totals to
+    /// the ancestors exactly once. The directory keeps its node id so UI rows that reference it stay valid.
+    /// Returns false (store untouched) if the node is not a live directory.
+    /// Old descendants are tombstoned, not reclaimed; their FRN map slots may keep pointing at them, which is
+    /// harmless: lookups skip deleted nodes and a later map write for the same MFT index simply overwrites the slot.
+    /// The scratch store must no longer be in use by anything else.
+    /// </summary>
+    public bool GraftBranch(int dirNodeId, FileSystemStore scratch)
+    {
+        if (ReferenceEquals(scratch, this))
+            throw new ArgumentException("The scratch store must be a different store.", nameof(scratch));
+
+        lock (_syncLock)
+        {
+            if (dirNodeId < 0 || dirNodeId >= _nodeCount)
+                return false;
+
+            NodeRecord dir = GetNodeRef(dirNodeId);
+            if (dir.IsDeleted || !dir.IsDirectory)
+                return false;
+
+            NodeRecord scratchRoot = scratch.GetNodeRef(scratch.RootNodeId);
+            if (!scratchRoot.IsDirectory)
+                return false;
+
+            long oldSize = dir.Size;
+            int oldFiles = dir.FileCount;
+            int oldFolders = dir.FolderCount;
+
+            // Detach the old subtree. Its nodes stay allocated but are unreachable and unresolvable.
+            TombstoneSubtreeUnsafe(dirNodeId, includeRoot: false);
+            GetNodeRef(dirNodeId).FirstChildId = -1;
+
+            // Re-key the directory itself if the folder was replaced (same path, new FRN)
+            if (scratchRoot.FileId != 0 && scratchRoot.FileId != dir.FileId)
+            {
+                UnmapFileIdInternal(dir.FileId, dirNodeId);
+                GetNodeRef(dirNodeId).FileId = scratchRoot.FileId;
+                MapFileIdInternal(scratchRoot.FileId, dirNodeId);
+            }
+
+            CopyScratchSubtreeUnsafe(dirNodeId, scratch);
+
+            // Totals are recomputed over the copy (not taken from the scratch store, whose sizes assume it counted
+            // every link); the ancestors get the difference once
+            ComputeTotalsUnsafe(dirNodeId);
+            ref NodeRecord dirRec = ref GetNodeRef(dirNodeId);
+
+            if (dirRec.ParentId >= 0)
+            {
+                PropagateDeltaUnsafe(
+                    dirRec.ParentId,
+                    dirRec.Size - oldSize,
+                    dirRec.FileCount - oldFiles,
+                    dirRec.FolderCount - oldFolders);
+            }
+
+            if (_linkGroups.Count > 0)
+                HandOverOrphanedLinkSizesUnsafe();
+
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Copies everything below the scratch store's root into the (childless) directory <paramref name="dirNodeId"/>,
+    /// breadth first. Totals are not computed here.
+    /// Hard links: whatever was tombstoned before the call is unresolvable, so a file whose FRN still resolves here
+    /// belongs to a node outside the copied branch and is already counted; AddAndMapNodeUnsafe then gives the copied
+    /// name size 0. The scratch store has its own carrier per file, so every copy of a linked file is given the file's
+    /// size and the first one copied becomes the carrier here, whatever the copy order.
+    /// </summary>
+    private void CopyScratchSubtreeUnsafe(int dirNodeId, FileSystemStore scratch)
+    {
+        // (scratch directory id, id of its counterpart in this store)
+        var pending = new Queue<(int ScratchDirId, int NewDirId)>(256);
+        pending.Enqueue((scratch.RootNodeId, dirNodeId));
+
+        while (pending.Count > 0)
+        {
+            (int scratchDirId, int newDirId) = pending.Dequeue();
+
+            int firstChild = -1;
+            int scratchChildId = scratch.GetNodeRef(scratchDirId).FirstChildId;
+            while (scratchChildId != -1)
+            {
+                int currentScratchId = scratchChildId;
+                NodeRecord sc = scratch.GetNodeRef(currentScratchId);
+                scratchChildId = sc.NextSiblingId;
+                if (sc.IsDeleted)
+                    continue;
+
+                long size = sc.Size;
+                if (!sc.IsDirectory && sc.FileId != 0 &&
+                    scratch.TryGetNodeByFileIdUnsafe(sc.FileId, out int scratchCarrierId) &&
+                    scratch.GetNodeRef(scratchCarrierId).FileId == sc.FileId)
+                {
+                    size = scratch.GetNodeRef(scratchCarrierId).Size;
+                }
+
+                int newId = AddAndMapNodeUnsafe(newDirId, scratch.GetNameUnsafe(currentScratchId), size, sc.FileId, sc.IsDirectory);
+                GetNodeRef(newId).NextSiblingId = firstChild;
+                firstChild = newId;
+
+                if (sc.IsDirectory)
+                    pending.Enqueue((currentScratchId, newId));
+            }
+
+            GetNodeRef(newDirId).FirstChildId = firstChild;
+        }
+    }
+
+    /// <summary>
+    /// Makes <paramref name="name"/> a child of directory <paramref name="parentId"/> that was scanned elsewhere: the
+    /// root of <paramref name="scratch"/> is the directory (copied with everything below it), or, with a null scratch
+    /// store, a file of <paramref name="fileSize"/> bytes. A live child of the same name is replaced. Everything happens
+    /// under one lock and the ancestors get the net difference exactly once, so it is safe next to a monitor that
+    /// applies the same change: whichever comes second finds the node in place and changes nothing more.
+    /// This is the delta for a move into a drive root, where a branch refresh would be a rescan of the whole drive.
+    /// Returns the new node id, or -1 if the parent is not a live directory.
+    /// </summary>
+    public int ReplaceChildWithScanned(int parentId, string name, ulong fileId, long fileSize, FileSystemStore? scratch)
+    {
+        lock (_syncLock)
+        {
+            if (parentId < 0 || parentId >= _nodeCount)
+                return -1;
+
+            NodeRecord parent = GetNodeRef(parentId);
+            if (parent.IsDeleted || !parent.IsDirectory)
+                return -1;
+
+            int existingId = FindChildByNameUnsafe(parentId, name);
+            if (existingId > 0)
+                DeleteNodeUnsafe(existingId);
+
+            bool isDirectory = scratch != null;
+            int newId = AddAndMapNodeUnsafe(parentId, name, isDirectory ? 0 : fileSize, fileId, isDirectory);
+            GetNodeRef(newId).NextSiblingId = GetNodeRef(parentId).FirstChildId;
+            GetNodeRef(parentId).FirstChildId = newId;
+
+            if (scratch != null)
+            {
+                CopyScratchSubtreeUnsafe(newId, scratch);
+                ComputeTotalsUnsafe(newId);
+            }
+
+            NodeRecord added = GetNodeRef(newId);
+            PropagateDeltaUnsafe(
+                parentId,
+                added.Size,
+                isDirectory ? added.FileCount : 1,
+                isDirectory ? 1 + added.FolderCount : 0);
+
+            if (_linkGroups.Count > 0)
+                HandOverOrphanedLinkSizesUnsafe();
+
+            return newId;
+        }
+    }
+
+    /// <summary>Finds the live node at <paramref name="fullPath"/> by walking down from the root by name (case-insensitive). The root path itself gives node 0.</summary>
+    public bool TryFindNodeByPath(string fullPath, out int nodeId)
+    {
+        nodeId = -1;
+        string rootNoSlash = RootPath.TrimEnd('\\');
+        if (!fullPath.StartsWith(rootNoSlash, StringComparison.OrdinalIgnoreCase) ||
+            (fullPath.Length > rootNoSlash.Length && fullPath[rootNoSlash.Length] != '\\'))
+            return false;
+
+        string rest = fullPath.Substring(rootNoSlash.Length).Trim('\\');
+        lock (_syncLock)
+        {
+            int current = 0;
+            if (rest.Length > 0)
+            {
+                foreach (string part in rest.Split('\\'))
+                {
+                    current = FindChildByNameUnsafe(current, part);
+                    if (current < 0)
+                        return false;
+                }
+            }
+
+            if (GetNodeRef(current).IsDeleted)
+                return false;
+
+            nodeId = current;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// A hard-linked file whose carrier was tombstoned (in a replaced or deleted subtree) and which still has a live
+    /// name elsewhere is no longer counted by anyone: the first live name takes over the size and the FRN map slot.
+    /// Walks only the linked files, so it is cheap enough to run after a graft.
+    /// </summary>
+    private void HandOverOrphanedLinkSizesUnsafe()
+    {
+        foreach ((ulong fileId, List<int> group) in _linkGroups.ToArray())
+        {
+            if (!TryGetMappedNodeUnsafe(fileId, out int mapped) || !GetNodeRef(mapped).IsDeleted)
+                continue;
+
+            int heirId = -1;
+            foreach (int id in group)
+            {
+                ref NodeRecord candidate = ref GetNodeRef(id);
+                if (!candidate.IsDeleted && candidate.FileId == fileId)
+                {
+                    heirId = id;
+                    break;
+                }
+            }
+            if (heirId < 0)
+                continue;
+
+            long size = GetNodeRef(mapped).Size;
+            GetNodeRef(heirId).Size = size;
+            MapFileIdInternal(fileId, heirId);
+            if (size != 0)
+                PropagateDeltaUnsafe(GetNodeRef(heirId).ParentId, size, 0, 0);
+        }
     }
 
     private void MoveNodeParentUnsafe(int nodeId, int newParentId)

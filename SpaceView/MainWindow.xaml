@@ -86,13 +86,21 @@
         </Style>
 
         <!-- Context Menu for Tree Rows -->
-        <ContextMenu x:Key="RowContextMenu" Background="#1E293B" Foreground="#F8FAFC" BorderBrush="#475569" BorderThickness="1">
-            <MenuItem Header="Open in Explorer" Click="MenuOpenInExplorer_Click"/>
+        <ContextMenu x:Key="RowContextMenu" Background="#1E293B" Foreground="#F8FAFC" BorderBrush="#475569" BorderThickness="1" Opened="RowContextMenu_Opened">
+            <MenuItem Header="Open in Explorer" Tag="SingleOnly" Click="MenuOpenInExplorer_Click"/>
             <MenuItem Header="Copy Full Path" Click="MenuCopyPath_Click"/>
             <Separator Background="#334155"/>
-            <MenuItem Header="Properties" Click="MenuProperties_Click"/>
+            <MenuItem Header="Cut" InputGestureText="Ctrl+X" Tag="Cut" Click="MenuCut_Click"/>
+            <MenuItem Header="Paste" InputGestureText="Ctrl+V" Tag="Paste" Click="MenuPaste_Click"/>
+            <MenuItem Header="Move to..." Tag="MoveTo" Click="MenuMoveTo_Click"/>
             <Separator Background="#334155"/>
-            <MenuItem Header="Delete to Recycle Bin" Foreground="#FB7185" Click="MenuDeleteToRecycleBin_Click"/>
+            <MenuItem Header="Refresh Branch" InputGestureText="F5" Tag="RefreshBranch" Click="MenuRefreshBranch_Click"/>
+            <Separator Background="#334155"/>
+            <MenuItem Header="Properties" Tag="SingleOnly" Click="MenuProperties_Click"/>
+            <Separator Background="#334155"/>
+            <MenuItem Header="Delete to Recycle Bin" InputGestureText="Del" Foreground="#FB7185" Tag="Delete" Click="MenuDeleteToRecycleBin_Click"/>
+            <Separator Background="#334155" Tag="RemoveDrive"/>
+            <MenuItem Header="Remove Drive from View" Tag="RemoveDrive" Click="MenuRemoveDrive_Click"/>
         </ContextMenu>
     </Window.Resources>
 
@@ -273,7 +281,10 @@
                      ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                      ScrollViewer.VerticalScrollBarVisibility="Visible"
                      HorizontalContentAlignment="Stretch"
-                     MouseDoubleClick="TreeListBox_MouseDoubleClick">
+                     SelectionMode="Extended"
+                     MouseDoubleClick="TreeListBox_MouseDoubleClick"
+                     SelectionChanged="TreeListBox_SelectionChanged"
+                     KeyDown="TreeListBox_KeyDown">
 
                 <ListBox.ItemContainerStyle>
                     <Style TargetType="ListBoxItem">
@@ -283,6 +294,8 @@
                         <Setter Property="BorderBrush" Value="#1E293B"/>
                         <Setter Property="BorderThickness" Value="0,0,0,1"/>
                         <Setter Property="ContextMenu" Value="{StaticResource RowContextMenu}"/>
+                        <EventSetter Event="PreviewMouseRightButtonDown" Handler="TreeListBoxItem_PreviewMouseRightButtonDown"/>
+                        <EventSetter Event="PreviewMouseLeftButtonDown" Handler="TreeListBoxItem_PreviewMouseLeftButtonDown"/>
                         <Setter Property="Template">
                             <Setter.Value>
                                 <ControlTemplate TargetType="ListBoxItem">
@@ -300,16 +313,31 @@
                                         <Trigger Property="IsSelected" Value="True">
                                             <Setter TargetName="RowBorder" Property="Background" Value="#1E3A5F"/>
                                         </Trigger>
+                                        <!-- Selected rows stay distinguishable from the hover highlight (a hovered row inside a multi-selection) -->
+                                        <MultiTrigger>
+                                            <MultiTrigger.Conditions>
+                                                <Condition Property="IsSelected" Value="True"/>
+                                                <Condition Property="IsMouseOver" Value="True"/>
+                                            </MultiTrigger.Conditions>
+                                            <Setter TargetName="RowBorder" Property="Background" Value="#27508A"/>
+                                        </MultiTrigger>
                                     </ControlTemplate.Triggers>
                                 </ControlTemplate>
                             </Setter.Value>
                         </Setter>
+                        <Style.Triggers>
+                            <!-- The "more items" row is not a file or folder: no context menu -->
+                            <DataTrigger Binding="{Binding IsMoreRow}" Value="True">
+                                <Setter Property="ContextMenu" Value="{x:Null}"/>
+                                <Setter Property="Cursor" Value="Hand"/>
+                            </DataTrigger>
+                        </Style.Triggers>
                     </Style>
                 </ListBox.ItemContainerStyle>
 
                 <ListBox.ItemTemplate>
                     <DataTemplate DataType="{x:Type models:TreeRowViewModel}">
-                        <Grid Height="24">
+                        <Grid x:Name="RowGrid" Height="24">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="200"/>
@@ -322,6 +350,7 @@
                             <StackPanel Grid.Column="0"
                                         Orientation="Horizontal"
                                         Margin="{Binding IndentMargin}"
+                                        ToolTip="{Binding ToolTipText}"
                                         VerticalAlignment="Center">
                                 <ToggleButton Style="{StaticResource TreeChevronStyle}"
                                               Visibility="{Binding ExpandButtonVisibility}"
@@ -355,6 +384,9 @@
                                                     <DataTrigger Binding="{Binding IsDirectory}" Value="True">
                                                         <Setter Property="Visibility" Value="Collapsed"/>
                                                     </DataTrigger>
+                                                    <DataTrigger Binding="{Binding IsMoreRow}" Value="True">
+                                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                                    </DataTrigger>
                                                 </Style.Triggers>
                                             </Style>
                                         </Path.Style>
@@ -362,14 +394,43 @@
                                 </Grid>
 
                                 <TextBlock Text="{Binding Name}"
-                                           Foreground="#F1F5F9"
                                            FontSize="12.5"
                                            VerticalAlignment="Center"
-                                           TextTrimming="CharacterEllipsis"/>
+                                           TextTrimming="CharacterEllipsis">
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Foreground" Value="#F1F5F9"/>
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsRoot}" Value="True">
+                                                    <Setter Property="FontWeight" Value="Bold"/>
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding IsMoreRow}" Value="True">
+                                                    <Setter Property="Foreground" Value="#38BDF8"/>
+                                                    <Setter Property="FontStyle" Value="Italic"/>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+
+                                <!-- Drive rows only: format, free space and monitor mode, then a state marker -->
+                                <TextBlock Text="{Binding SubText}"
+                                           Visibility="{Binding SubTextVisibility}"
+                                           Foreground="#94A3B8"
+                                           FontSize="11.5"
+                                           Margin="12,0,0,0"
+                                           VerticalAlignment="Center"/>
+                                <TextBlock Text="{Binding Marker}"
+                                           Visibility="{Binding MarkerVisibility}"
+                                           Foreground="#F59E0B"
+                                           FontSize="11.5"
+                                           FontWeight="SemiBold"
+                                           Margin="12,0,0,0"
+                                           VerticalAlignment="Center"/>
                             </StackPanel>
 
                             <!-- Column 1: % of Parent Bar + Text -->
-                            <Grid Grid.Column="1" Margin="8,2,8,2" VerticalAlignment="Center">
+                            <Grid Grid.Column="1" Margin="8,2,8,2" VerticalAlignment="Center" Visibility="{Binding DetailVisibility}">
                                 <ProgressBar Minimum="0"
                                              Maximum="100"
                                              Value="{Binding PercentOfParent, Mode=OneWay}"
@@ -406,6 +467,7 @@
 
                             <!-- Column 2: Size -->
                             <TextBlock Grid.Column="2"
+                                       Visibility="{Binding DetailVisibility}"
                                        Text="{Binding SizeText}"
                                        Foreground="#E2E8F0"
                                        FontWeight="SemiBold"
@@ -415,6 +477,7 @@
 
                             <!-- Column 3: File Count -->
                             <TextBlock Grid.Column="3"
+                                       Visibility="{Binding DetailVisibility}"
                                        Text="{Binding FileCountText}"
                                        Foreground="#94A3B8"
                                        FontSize="12"
@@ -423,12 +486,19 @@
 
                             <!-- Column 4: Folder Count -->
                             <TextBlock Grid.Column="4"
+                                       Visibility="{Binding DetailVisibility}"
                                        Text="{Binding FolderCountText}"
                                        Foreground="#94A3B8"
                                        FontSize="12"
                                        TextAlignment="Right"
                                        VerticalAlignment="Center"/>
                         </Grid>
+                        <DataTemplate.Triggers>
+                            <!-- Cut rows (waiting to be pasted) are dimmed -->
+                            <DataTrigger Binding="{Binding IsCut}" Value="True">
+                                <Setter TargetName="RowGrid" Property="Opacity" Value="0.45"/>
+                            </DataTrigger>
+                        </DataTemplate.Triggers>
                     </DataTemplate>
                 </ListBox.ItemTemplate>
             </ListBox>
@@ -460,15 +530,6 @@
                                Foreground="#94A3B8"
                                TextAlignment="Center"
                                TextWrapping="Wrap"/>
-                    <ProgressBar x:Name="ScanProgressBar"
-                                 Width="280"
-                                 Height="6"
-                                 Margin="0,18,0,0"
-                                 IsIndeterminate="True"
-                                 Background="#1E293B"
-                                 Foreground="#38BDF8"
-                                 BorderThickness="0"
-                                 Visibility="Collapsed"/>
                 </StackPanel>
             </Border>
         </Grid>
@@ -484,6 +545,7 @@
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
 
                 <TextBlock x:Name="StatusTextBlock"
@@ -492,19 +554,38 @@
                            Foreground="#94A3B8"
                            FontSize="12"
                            VerticalAlignment="Center"
-                           TextTrimming="CharacterEllipsis"/>
+                           TextTrimming="CharacterEllipsis"
+                           ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/>
+
+                <!-- Shown while a drive is in limited mode or skipped folders and SpaceView is not elevated -->
+                <Button x:Name="ElevateButton"
+                        Grid.Column="1"
+                        Style="{StaticResource ToolbarButtonStyle}"
+                        Padding="10,3"
+                        FontSize="12"
+                        Margin="12,0,0,0"
+                        Visibility="Collapsed"
+                        Click="ElevateButton_Click">
+                    <StackPanel Orientation="Horizontal">
+                        <Image x:Name="ShieldImage" Width="16" Height="16" Margin="0,0,6,0" Visibility="Collapsed"/>
+                        <TextBlock Text="Run as administrator" VerticalAlignment="Center"/>
+                    </StackPanel>
+                </Button>
 
                 <TextBlock x:Name="StatsTextBlock"
-                           Grid.Column="1"
+                           Grid.Column="2"
                            Text=""
                            Foreground="#CBD5E1"
                            FontSize="12"
                            FontWeight="Medium"
                            VerticalAlignment="Center"
-                           Margin="20,0"/>
+                           Margin="20,0"
+                           MaxWidth="420"
+                           TextTrimming="CharacterEllipsis"
+                           ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/>
 
                 <TextBlock x:Name="MemoryTextBlock"
-                           Grid.Column="2"
+                           Grid.Column="3"
                            Text="RAM: —"
                            Foreground="#64748B"
                            FontSize="11.5"

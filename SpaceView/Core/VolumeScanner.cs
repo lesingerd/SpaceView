@@ -22,11 +22,52 @@ public sealed class ScanResult
     public bool UsnJournalReady { get; init; }
     public ulong UsnJournalId { get; init; }
     public long StartUsn { get; init; }
+    /// <summary>Directories that could not be listed (or only partly); their contents are missing from the store.</summary>
+    public int InaccessibleDirectories { get; init; }
+}
+
+public sealed class BranchScanResult
+{
+    /// <summary>Scratch store whose root node is the scanned folder.</summary>
+    public required FileSystemStore Store { get; init; }
+    public required TimeSpan Duration { get; init; }
+    /// <summary>False if the folder itself could not be opened or listed (the store is then empty and must not be grafted).</summary>
+    public bool RootListed { get; init; }
+    /// <summary>Sub-directories that could not be listed (access denied, vanished mid-scan, ...); their contents are missing.</summary>
+    public int InaccessibleDirectories { get; init; }
 }
 
 public static class VolumeScanner
 {
     private const uint BufferSize = 64 * 1024; // 64 KB buffer per worker thread
+
+    /// <summary>Shared by the scan workers to report directories that could not be listed.</summary>
+    private sealed class ScanCounters
+    {
+        private int _inaccessibleDirectories;
+        private int _rootListed;
+
+        public int InaccessibleDirectories => Volatile.Read(ref _inaccessibleDirectories);
+        public bool RootListed => Volatile.Read(ref _rootListed) != 0;
+
+        public void RecordListed(bool isRoot)
+        {
+            if (isRoot)
+                Volatile.Write(ref _rootListed, 1);
+        }
+
+        public void RecordUnlistable(bool isRoot)
+        {
+            if (!isRoot)
+                Interlocked.Increment(ref _inaccessibleDirectories);
+        }
+
+        /// <summary>A directory whose listing broke off part-way (or whose processing failed): what was read is kept, the rest is missing.</summary>
+        public void RecordIncomplete()
+        {
+            Interlocked.Increment(ref _inaccessibleDirectories);
+        }
+    }
 
     static VolumeScanner()
     {
@@ -52,13 +93,38 @@ public static class VolumeScanner
         return await Task.Run(() => ExecuteScan(rootPath, isNtfs, progress, cancellationToken), cancellationToken);
     }
 
+    /// <summary>
+    /// Scans one folder (and everything below it) into a new scratch store, for grafting into an existing
+    /// store with <see cref="FileSystemStore.GraftBranch"/>. Never touches the USN journal.
+    /// </summary>
+    public static async Task<BranchScanResult> ScanBranchAsync(
+        string folderPath,
+        IProgress<ScanProgressReport>? progress,
+        CancellationToken cancellationToken)
+    {
+        var counters = new ScanCounters();
+        ScanResult result = await Task.Run(
+            () => ExecuteScan(folderPath, isNtfs: false, progress, cancellationToken, counters),
+            cancellationToken);
+
+        return new BranchScanResult
+        {
+            Store = result.Store,
+            Duration = result.Duration,
+            RootListed = counters.RootListed,
+            InaccessibleDirectories = counters.InaccessibleDirectories
+        };
+    }
+
     private static ScanResult ExecuteScan(
         string rootPath,
         bool isNtfs,
         IProgress<ScanProgressReport>? progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ScanCounters? counters = null)
     {
         var sw = Stopwatch.StartNew();
+        counters ??= new ScanCounters();
 
         ulong usnJournalId = 0;
         long startUsn = 0;
@@ -76,7 +142,9 @@ public static class VolumeScanner
         int pendingDirectories = 1;
         workQueue.Enqueue((store.RootNodeId, store.RootPath));
 
-        int workerCount = Math.Clamp(Environment.ProcessorCount, 4, 16);
+        // At most 8: idle workers spin while the queue is empty, and 16 open directory handles only queue up on the
+        // disk. Drives are scanned one at a time (see MainWindow), so more workers would not make the whole faster.
+        int workerCount = Math.Clamp(Environment.ProcessorCount, 2, 8);
         var workers = new Task[workerCount];
 
         using var progressCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -104,7 +172,7 @@ public static class VolumeScanner
 
         for (int w = 0; w < workerCount; w++)
         {
-            workers[w] = Task.Run(() => RunWorker(store, workQueue, ref pendingDirectories, cancellationToken), CancellationToken.None);
+            workers[w] = Task.Run(() => RunWorker(store, workQueue, ref pendingDirectories, counters, cancellationToken), CancellationToken.None);
         }
 
         Task.WaitAll(workers);
@@ -128,7 +196,9 @@ public static class VolumeScanner
             IsNtfs = isNtfs,
             UsnJournalReady = usnReady,
             UsnJournalId = usnJournalId,
-            StartUsn = startUsn
+            StartUsn = startUsn,
+            // An unlistable scan root is not counted by the workers (the branch scan reports it via RootListed)
+            InaccessibleDirectories = counters.InaccessibleDirectories + (counters.RootListed ? 0 : 1)
         };
     }
 
@@ -136,6 +206,7 @@ public static class VolumeScanner
         FileSystemStore store,
         ConcurrentQueue<(int NodeId, string Path)> workQueue,
         ref int pendingDirectories,
+        ScanCounters? counters,
         CancellationToken cancellationToken)
     {
         byte* buffer = (byte*)NativeMemory.AlignedAlloc(BufferSize, 8);
@@ -152,6 +223,8 @@ public static class VolumeScanner
                     spin.Reset();
                     try
                     {
+                        // One bad directory must not lose the whole scan (an escaping exception would surface
+                        // from Task.WaitAll as an AggregateException): count it and carry on.
                         ScanSingleDirectory(
                             store,
                             currentDir.NodeId,
@@ -161,7 +234,16 @@ public static class VolumeScanner
                             dirNames,
                             workQueue,
                             ref pendingDirectories,
+                            counters,
                             cancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Cancelled: the loop condition ends this worker and the caller rethrows
+                    }
+                    catch (Exception)
+                    {
+                        counters?.RecordIncomplete();
                     }
                     finally
                     {
@@ -189,10 +271,13 @@ public static class VolumeScanner
         List<string> dirNames,
         ConcurrentQueue<(int NodeId, string Path)> workQueue,
         ref int pendingDirectories,
+        ScanCounters? counters,
         CancellationToken ct)
     {
         if (ct.IsCancellationRequested)
             return;
+
+        bool isScanRoot = dirNodeId == store.RootNodeId;
 
         // Use extended-length path prefix \\?\ to handle paths > 260 characters seamlessly
         string nativePath = dirPath.StartsWith(@"\\?\", StringComparison.Ordinal)
@@ -209,18 +294,44 @@ public static class VolumeScanner
             IntPtr.Zero);
 
         if (hDir.IsInvalid)
+        {
+            counters?.RecordUnlistable(isScanRoot);
             return;
+        }
 
         batchEntries.Clear();
         dirNames.Clear();
 
         int infoClass = NtfsNative.FileIdBothDirectoryRestartInfo;
+        bool firstRead = true;
 
         while (!ct.IsCancellationRequested)
         {
             bool ok = NtfsNative.GetFileInformationByHandleEx(hDir, infoClass, buffer, BufferSize);
             if (!ok)
+            {
+                // Only ERROR_NO_MORE_FILES ends a listing normally (on the first read: an empty directory).
+                // Anything else means the listing is broken off: keep the entries already read and count it.
+                bool endOfListing = Marshal.GetLastWin32Error() == NtfsNative.ERROR_NO_MORE_FILES;
+                if (firstRead)
+                {
+                    if (endOfListing)
+                        counters?.RecordListed(isScanRoot);
+                    else
+                        counters?.RecordUnlistable(isScanRoot);
+                }
+                else if (!endOfListing)
+                {
+                    counters?.RecordIncomplete();
+                }
                 break;
+            }
+
+            if (firstRead)
+            {
+                firstRead = false;
+                counters?.RecordListed(isScanRoot);
+            }
 
             infoClass = NtfsNative.FileIdBothDirectoryInfo;
 
@@ -244,11 +355,14 @@ public static class VolumeScanner
                         bool isDir = (attrs & NtfsNative.FILE_ATTRIBUTE_DIRECTORY) != 0;
                         bool isReparse = (attrs & NtfsNative.FILE_ATTRIBUTE_REPARSE_POINT) != 0;
 
-                        // Skip directory junctions / symlinks to avoid cycles and double-counting
-                        if (!(isDir && isReparse))
+                        // Skip directory symlinks and junctions (name-surrogate reparse points) to avoid cycles and
+                        // double-counting. Other reparse directories, such as OneDrive placeholders, are real folders.
+                        // For a reparse point the directory listing reports the reparse tag in EaSize.
+                        if (!(isDir && isReparse && NtfsNative.IsReparseTagNameSurrogate(info->EaSize)))
                         {
                             string name = new string(nameSpan);
-                            long size = isDir ? 0 : Math.Max(0, info->EndOfFile);
+                            // Size on disk (allocated bytes), the same figure the live monitor reads from FileStandardInfo
+                            long size = isDir ? 0 : Math.Max(0, info->AllocationSize);
                             ulong fileId = (ulong)info->FileId;
 
                             batchEntries.Add(new PendingChildEntry(name, size, fileId, isDir));

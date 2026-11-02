@@ -16,10 +16,22 @@ public static unsafe class NtfsNative
 
     public const uint OPEN_EXISTING = 3;
     public const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+    /// <summary>Open the reparse point itself instead of following it (never recalls cloud content, never crosses a link).</summary>
+    public const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
 
     public const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
     public const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
 
+    // Bit 29 of a reparse tag marks name-surrogate reparse points (symlinks 0xA000000C, mount points/junctions
+    // 0xA0000003): they redirect to another part of the namespace. Cloud placeholders (OneDrive 0x9000xxxx),
+    // dedup, WSL and similar tags are not name surrogates and are ordinary files/folders.
+    private const uint ReparseTagNameSurrogate = 0x20000000;
+
+    /// <summary>Equivalent of the SDK's IsReparseTagNameSurrogate macro.</summary>
+    public static bool IsReparseTagNameSurrogate(uint reparseTag) => (reparseTag & ReparseTagNameSurrogate) != 0;
+
+    public const int FileStandardInfo = 1;
+    public const int FileAttributeTagInfo = 9;
     public const int FileIdBothDirectoryInfo = 10;
     public const int FileIdBothDirectoryRestartInfo = 11;
 
@@ -27,6 +39,7 @@ public static unsafe class NtfsNative
     public const int ERROR_HANDLE_EOF = 38;
     public const int ERROR_JOURNAL_ENTRY_DELETED = 1181;
     public const int ERROR_JOURNAL_NOT_ACTIVE = 1179;
+    public const int ERROR_JOURNAL_DELETE_IN_PROGRESS = 1178;
 
     // DeviceIoControl codes for USN Journal and MFT
     public const uint FSCTL_ENUM_USN_DATA = 0x000900b3;
@@ -42,6 +55,7 @@ public static unsafe class NtfsNative
     public const uint USN_REASON_FILE_DELETE = 0x00000200;
     public const uint USN_REASON_RENAME_OLD_NAME = 0x00001000;
     public const uint USN_REASON_RENAME_NEW_NAME = 0x00002000;
+    public const uint USN_REASON_HARD_LINK_CHANGE = 0x00010000;
     public const uint USN_REASON_CLOSE = 0x80000000;
 
     [StructLayout(LayoutKind.Sequential)]
@@ -62,6 +76,25 @@ public static unsafe class NtfsNative
         public fixed char ShortName[12];
         public long FileId;
         public fixed char FileName[1];
+    }
+
+    /// <summary>FILE_STANDARD_INFO (GetFileInformationByHandleEx, FileStandardInfo).</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FILE_STANDARD_INFO
+    {
+        public long AllocationSize;
+        public long EndOfFile;
+        public uint NumberOfLinks;
+        public byte DeletePending;
+        public byte Directory;
+    }
+
+    /// <summary>FILE_ATTRIBUTE_TAG_INFO (GetFileInformationByHandleEx, FileAttributeTagInfo).</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FILE_ATTRIBUTE_TAG_INFO
+    {
+        public uint FileAttributes;
+        public uint ReparseTag;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -126,15 +159,26 @@ public static unsafe class NtfsNative
         public uint dwSize;
         public int Type; // 0 = FileIdType
         public ulong FileId;
+        // The native descriptor ends in a 16-byte union (FILE_ID_128), so the struct is 24 bytes.
+        public ulong UnionPadding;
+    }
+
+    // Win32 FILETIME is two 32-bit halves (4-byte aligned). Declaring it as a long would shift
+    // every following field of BY_HANDLE_FILE_INFORMATION by 4 bytes.
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FILETIME
+    {
+        public uint LowDateTime;
+        public uint HighDateTime;
     }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct BY_HANDLE_FILE_INFORMATION
     {
         public uint FileAttributes;
-        public long CreationTime;
-        public long LastAccessTime;
-        public long LastWriteTime;
+        public FILETIME CreationTime;
+        public FILETIME LastAccessTime;
+        public FILETIME LastWriteTime;
         public uint VolumeSerialNumber;
         public uint FileSizeHigh;
         public uint FileSizeLow;
@@ -175,6 +219,49 @@ public static unsafe class NtfsNative
     public static extern bool GetFileSizeEx(
         SafeFileHandle hFile,
         out long lpFileSize);
+
+    /// <summary>
+    /// Opens a file or directory for attribute queries only, without following a reparse point and without
+    /// requesting data access, so a cloud placeholder is neither recalled nor hydrated.
+    /// </summary>
+    public static SafeFileHandle OpenForQuery(string path)
+    {
+        // The \\?\ prefix turns off path normalisation and the MAX_PATH limit; UNC and already-prefixed paths are left alone
+        string native = path.StartsWith(@"\\", StringComparison.Ordinal) ? path : @"\\?\" + path;
+        return CreateFileW(
+            native,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_ALL,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            IntPtr.Zero);
+    }
+
+    /// <summary>Size on disk (allocated bytes) of the opened file; the same figure a directory listing reports as AllocationSize.</summary>
+    public static bool TryGetAllocationSize(SafeFileHandle hFile, out long allocationSize)
+    {
+        FILE_STANDARD_INFO info;
+        if (!hFile.IsInvalid && GetFileInformationByHandleEx(hFile, FileStandardInfo, (byte*)&info, (uint)sizeof(FILE_STANDARD_INFO)))
+        {
+            allocationSize = Math.Max(0, info.AllocationSize);
+            return true;
+        }
+        allocationSize = 0;
+        return false;
+    }
+
+    public static bool TryGetReparseTag(SafeFileHandle hFile, out uint reparseTag)
+    {
+        FILE_ATTRIBUTE_TAG_INFO info;
+        if (!hFile.IsInvalid && GetFileInformationByHandleEx(hFile, FileAttributeTagInfo, (byte*)&info, (uint)sizeof(FILE_ATTRIBUTE_TAG_INFO)))
+        {
+            reparseTag = info.ReparseTag;
+            return true;
+        }
+        reparseTag = 0;
+        return false;
+    }
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern SafeFileHandle OpenFileById(

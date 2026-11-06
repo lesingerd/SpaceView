@@ -26,10 +26,30 @@ public static class ActivityTargets
         IReadOnlyCollection<int> nodeIds,
         IReadOnlyDictionary<RowKey, TRow> displayed,
         int maxNodes = MaxNodes)
+        where TRow : class =>
+        Resolve(store, nodeIds, displayed.Count, (int id, out TRow? row) => displayed.TryGetValue(new RowKey(session, id), out row), maxNodes);
+
+    /// <summary><see cref="Resolve{TRow}(FileSystemStore, DriveSession, IReadOnlyCollection{int}, IReadOnlyDictionary{RowKey, TRow}, int)"/> with the displayed rows of one drive keyed by node id.</summary>
+    public static List<TRow> Resolve<TRow>(
+        FileSystemStore store,
+        IReadOnlyCollection<int> nodeIds,
+        IReadOnlyDictionary<int, TRow> displayedById,
+        int maxNodes = MaxNodes)
+        where TRow : class =>
+        Resolve(store, nodeIds, displayedById.Count, (int id, out TRow? row) => displayedById.TryGetValue(id, out row), maxNodes);
+
+    private delegate bool TryGetRow<TRow>(int id, out TRow? row);
+
+    private static List<TRow> Resolve<TRow>(
+        FileSystemStore store,
+        IReadOnlyCollection<int> nodeIds,
+        int displayedCount,
+        TryGetRow<TRow> tryGetRow,
+        int maxNodes)
         where TRow : class
     {
         var rows = new List<TRow>();
-        if (nodeIds.Count == 0 || displayed.Count == 0)
+        if (nodeIds.Count == 0 || displayedCount == 0)
             return rows;
 
         store.ReadParents(parentOf =>
@@ -57,7 +77,7 @@ public static class ActivityTargets
                         break;
 
                     chain.Add(id);
-                    if (displayed.TryGetValue(new RowKey(session, id), out target))
+                    if (tryGetRow(id, out target))
                         break;
 
                     id = parentOf(id);

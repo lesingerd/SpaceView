@@ -19,7 +19,7 @@ using Color = System.Windows.Media.Color;
 
 namespace SpaceView;
 
-public sealed class BulkObservableCollection<T> : ObservableCollection<T>
+public sealed class BulkObservableCollection<T> : ObservableCollection<T>, IRowList<T>
 {
     // Every bulk change is announced as a Reset, which clears the selection of the list showing the collection. These
     // two events bracket it so the window can note the selection before and put it back afterwards.
@@ -972,6 +972,7 @@ public partial class MainWindow : Window
             AddMoreRowIfNeeded(childRows, session, store, row.NodeId, childDepth, total, shownCount: childRows.Count);
             _visibleRows.InsertRange(rowIndex + 1, childRows);
             StatusTextBlock.Text = $"Loaded {row.Name}: {total:N0} items";
+            session.NeedsFullSync = true; // changes during the load are not in the rows
         }
         catch (Exception ex)
         {
@@ -1021,6 +1022,7 @@ public partial class MainWindow : Window
 
             AddMoreRowIfNeeded(pageRows, session, store, parentNodeId, depth, total, shownCount: shown.Count + pageRows.Count);
             _visibleRows.ReplaceRange(rowIndex, 1, pageRows);
+            session.NeedsFullSync = true; // changes during the load are not in the rows
             // The first new row becomes the selection, unless the user has several rows selected: that is kept
             if (pageRows.Count > 0 && TreeListBox.SelectedItems.Count <= 1)
                 TreeListBox.SelectedItem = pageRows[0];
@@ -1097,14 +1099,42 @@ public partial class MainWindow : Window
         if (!session.TryBeginUiRefresh(e))
             return;
 
-        Dispatcher.BeginInvoke(DispatcherPriority.Background, () =>
+        ScheduleLivePass(session, monitor);
+    }
+
+    /// <summary>
+    /// Queues a live-update pass at Background priority, no sooner than the pacing gap after the previous pass (a multiple
+    /// of how long that took), so a busy volume cannot keep the UI thread occupied: events arriving meanwhile coalesce.
+    /// </summary>
+    private void ScheduleLivePass(DriveSession session, NtfsUsnJournalMonitor monitor)
+    {
+        void Run()
         {
             // Clear the flag BEFORE refreshing: an event raised while the refresh runs then schedules
             // another pass instead of being swallowed.
             UsnMonitorEventArgs? args = session.EndUiRefresh();
             if (args != null && ReferenceEquals(session.Monitor, monitor))
                 ApplyLiveStoreUpdatesToVisibleRows(session, args);
-        });
+        }
+
+        int delay = session.PassDelayMs(Environment.TickCount64);
+        if (delay <= 0)
+        {
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, Run);
+            return;
+        }
+
+        _ = Task.Delay(delay).ContinueWith(_ =>
+        {
+            try
+            {
+                Dispatcher.BeginInvoke(DispatcherPriority.Background, Run);
+            }
+            catch (InvalidOperationException)
+            {
+                // The application is shutting down
+            }
+        }, TaskScheduler.Default);
     }
 
     /// <summary>
@@ -1196,139 +1226,59 @@ public partial class MainWindow : Window
         UsnStatusBadge.ToolTip = fullText;
     }
 
-    private void ApplyLiveStoreUpdatesToVisibleRows(DriveSession session, UsnMonitorEventArgs e)
+    // At most this many changed nodes are handled per pass; the rest wait for the next one
+    private const int MaxChangedPerPass = 1024;
+    // Deleted node ids are only looked at for reuse once this many are waiting
+    private const int ReclaimBatchMin = 64;
+
+    private DriveSession? _syncSession;
+    private FileSystemStore? _syncStore;
+    private LiveRowSync<TreeRowViewModel>? _rowSyncInstance;
+    private readonly List<int> _reclaimIds = new();
+    private readonly HashSet<int> _reclaimSet = new();
+    private readonly HashSet<int> _reclaimReferenced = new();
+
+    /// <summary>The row sync; it reads the session and store of the pass that is running (one pass at a time, UI thread).</summary>
+    private LiveRowSync<TreeRowViewModel> RowSync => _rowSyncInstance ??= new LiveRowSync<TreeRowViewModel>(
+        (snapshot, depth) => new TreeRowViewModel(_syncSession!, _syncStore!, snapshot, depth),
+        (parentNodeId, depth, remaining) => TreeRowViewModel.CreateMoreRow(_syncSession!, _syncStore!, parentNodeId, depth, remaining),
+        ChildPageSize);
+
+    /// <summary>
+    /// Brings this drive's rows in line with the store after live changes. Unless <paramref name="full"/> (the store was
+    /// changed from the UI, so the collected changed nodes do not describe it) or the changed-node collection overflowed,
+    /// only the rows the changed nodes can affect are looked at (see <see cref="LiveRowSync{TRow}"/>).
+    /// </summary>
+    private void ApplyLiveStoreUpdatesToVisibleRows(DriveSession session, UsnMonitorEventArgs e, bool full = false)
     {
-        HashSet<int> activity = session.TakeActivity();
+        long startMs = Environment.TickCount64;
+        HashSet<int> activity = session.TakeActivity(MaxChangedPerPass, out bool overflow, out bool more);
         FileSystemStore? store = session.Store;
         if (store == null || !TryGetSessionBlock(session, out int start, out int end))
             return;
 
-        // Only this drive's rows (start..end, root first) are looked at; `end` is kept in step with every insert/remove.
+        bool fullPass = full || overflow || session.NeedsFullSync;
+        session.NeedsFullSync = false;
+        store.AdvanceReclaimEpoch();
 
-        // 1. Remove any visible rows that were deleted or moved to a different parent
-        //    (and their descendants; a moved row reappears under its new parent in step 2)
-        for (int i = end - 1; i > start; i--)
-        {
-            var row = _visibleRows[i];
-            if (row.IsMoreRow)
-                continue; // no node of its own; it goes away with its folder's rows (or in step 2)
-
-            NodeRecord rec = store.GetNodeSnapshot(row.NodeId);
-            if (rec.IsDeleted || rec.ParentId != row.ParentNodeId)
-            {
-                int removeCount = 1;
-                while (i + removeCount < end &&
-                       _visibleRows[i + removeCount].Depth > row.Depth)
-                {
-                    removeCount++;
-                }
-                _visibleRows.RemoveRange(i, removeCount);
-                end -= removeCount;
-            }
-        }
-
-        // 2. Check if any expanded folders have newly created children not yet in _visibleRows
-        var existingRows = new HashSet<RowKey>();
-        for (int i = start + 1; i < end; i++)
-        {
-            if (!_visibleRows[i].IsMoreRow)
-                existingRows.Add(_visibleRows[i].Key);
-        }
-        var childPage = new List<NodeSnapshot>();
-        for (int i = start; i < end; i++)
-        {
-            var row = _visibleRows[i];
-            // A folder that is still being loaded gets its children from that load
-            if (row.IsDirectory && row.IsExpanded && !row.IsLoadingChildren)
-            {
-                int childDepth = row.Depth + 1;
-
-                // The block of rows below this folder: how many children are shown and where its "more items" row is
-                int shownChildren = 0;
-                int moreRowIndex = -1;
-                int blockEnd = i + 1;
-                while (blockEnd < end && _visibleRows[blockEnd].Depth > row.Depth)
-                {
-                    if (_visibleRows[blockEnd].Depth == childDepth)
-                    {
-                        if (_visibleRows[blockEnd].IsMoreRow)
-                            moreRowIndex = blockEnd;
-                        else
-                            shownChildren++;
-                    }
-                    blockEnd++;
-                }
-
-                // Only as many children as are on screen (at least one page) are looked at, so a huge folder
-                // does not grow beyond its pages; anything further down is counted by the "more items" row.
-                childPage.Clear();
-                int totalChildren = store.GetChildPage(row.NodeId, 0, Math.Max(shownChildren, ChildPageSize), childPage);
-
-                // Walk the children in size order with a cursor into the visible rows so each new child
-                // lands next to its sorted neighbours (existing rows are not re-ordered here).
-                int pos = i + 1;
-                int inserted = 0;
-                foreach (NodeSnapshot child in childPage)
-                {
-                    var childKey = new RowKey(session, child.NodeId);
-                    if (!existingRows.Contains(childKey))
-                    {
-                        var newRow = new TreeRowViewModel(session, store, child, childDepth);
-                        _visibleRows.Insert(pos++, newRow);
-                        existingRows.Add(childKey);
-                        inserted++;
-                        end++;
-                        continue;
-                    }
-
-                    // Existing child: move the cursor past its row and its visible descendants
-                    int probe = pos;
-                    while (probe < end && _visibleRows[probe].Depth >= childDepth &&
-                           _visibleRows[probe].Key != childKey)
-                    {
-                        probe++;
-                    }
-                    if (probe < end && _visibleRows[probe].Key == childKey)
-                    {
-                        pos = probe + 1;
-                        while (pos < end && _visibleRows[pos].Depth > childDepth)
-                            pos++;
-                    }
-                }
-
-                // Keep the "more items" row in step with the children that are not shown
-                blockEnd += inserted;
-                int remaining = totalChildren - (shownChildren + inserted);
-                if (moreRowIndex >= 0)
-                {
-                    moreRowIndex += inserted;
-                    if (remaining > 0)
-                    {
-                        _visibleRows[moreRowIndex].SetRemaining(remaining);
-                    }
-                    else
-                    {
-                        _visibleRows.RemoveAt(moreRowIndex);
-                        end--;
-                    }
-                }
-                else if (remaining > 0)
-                {
-                    _visibleRows.Insert(blockEnd, TreeRowViewModel.CreateMoreRow(session, store, row.NodeId, childDepth, remaining));
-                    end++;
-                }
-            }
-        }
+        // 1. Remove rows of deleted or moved nodes, 2. add rows for new children of expanded folders (kept in step with
+        //    the "more items" rows), 3. refresh the sizes, counts and % of parent of the rows that can have changed
+        _syncSession = session;
+        _syncStore = store;
+        end = RowSync.Apply(_visibleRows, start, end, store, fullPass ? null : activity, out bool needsFullNext);
+        if (needsFullNext)
+            session.NeedsFullSync = true;
+        RefreshRootRow(session);
 
         MarkCutRows();
 
-        // 3. Refresh this drive's visible rows' sizes, file/folder counts, and % of parent
         // 4. Update bottom status bar totals
-        RefreshSessionRows(session);
         UpdateStatsText();
 
         // The rows now match the store, so the changed nodes can be placed on them
-        PulseActivityRows(session, store, activity, start, end);
+        PulseActivityRows(store, activity);
+
+        ReclaimNodeIds(session, store, start, end);
 
         // 5. Update top USN badge (it describes the first drive)
         if (_sessions.Count > 0 && ReferenceEquals(_sessions[0], session))
@@ -1338,42 +1288,90 @@ public partial class MainWindow : Window
             SetMonitorBadgeText($"{drive} {(e.IsUsnJournalMode ? "USN live" : "Limited")}: {e.TotalEventsProcessed:N0} updates",
                 $"{drive} {modeLabel}: {e.TotalEventsProcessed:N0} updates ({e.LastChangedItem})");
         }
+
+        long endMs = Environment.TickCount64;
+        session.RecordPass(endMs, endMs - startMs);
+
+        // Changed nodes that did not fit in this pass wait for the next one
+        if (more && session.Monitor is NtfsUsnJournalMonitor monitor && session.TryBeginUiRefresh(e))
+            ScheduleLivePass(session, monitor);
     }
 
     /// <summary>
     /// Flashes, for each changed node, the lowest row that is displayed and contains it (see <see cref="ActivityTargets"/>).
     /// A change under a "more items" cut-off lights the folder's row, not the "more items" row. Skipped when Windows
-    /// animations are off. <paramref name="end"/> is the end of the drive's block after the rows were brought up to date.
+    /// animations are off. Uses the rows the sync just brought up to date.
     /// </summary>
-    private void PulseActivityRows(DriveSession session, FileSystemStore store, HashSet<int> activity, int start, int end)
+    private void PulseActivityRows(FileSystemStore store, HashSet<int> activity)
     {
         if (activity.Count == 0 || !SystemParameters.ClientAreaAnimation)
             return;
 
-        var displayed = new Dictionary<RowKey, TreeRowViewModel>(end - start);
-        for (int i = start; i < end; i++)
-        {
-            TreeRowViewModel row = _visibleRows[i];
-            if (!row.IsMoreRow)
-                displayed[row.Key] = row;
-        }
-
         long now = Environment.TickCount64;
-        foreach (TreeRowViewModel row in ActivityTargets.Resolve(store, session, activity, displayed))
+        foreach (TreeRowViewModel row in ActivityTargets.Resolve(store, activity, RowSync.Displayed))
         {
             row.Pulse(now);
         }
     }
 
-    private void RefreshSessionRows(DriveSession session)
+    /// <summary>
+    /// Makes ids of deleted nodes reusable once nothing refers to them: the store releases them two passes after the
+    /// delete, and only if no row of this drive has them as its node or parent, no cut key holds them, and no operation
+    /// that carries node ids across an await or a dialog is running (delete, move, branch refresh, a folder or page
+    /// loading in the background, a modal dialog over the window).
+    /// </summary>
+    private void ReclaimNodeIds(DriveSession session, FileSystemStore store, int start, int end)
     {
-        if (!TryGetSessionBlock(session, out int start, out int end))
+        if (store.PendingFreeCount < ReclaimBatchMin ||
+            _fileOperationInProgress || _branchCts != null || session.State != DriveSessionState.Ready || !IsMainWindowEnabled())
+        {
+            return;
+        }
+
+        _reclaimIds.Clear();
+        if (store.TakeReclaimable(_reclaimIds) == 0)
             return;
 
-        for (int i = start; i < end; i++)
+        _reclaimSet.Clear();
+        _reclaimSet.UnionWith(_reclaimIds);
+        _reclaimReferenced.Clear();
+        if (!RowSync.FindReferencedIds(_visibleRows, start, end, _reclaimSet, _reclaimReferenced))
         {
-            _visibleRows[i].RefreshFromStore();
+            store.ReturnReclaimable(_reclaimIds);
+            return;
         }
+
+        // A cut item whose node is gone is no longer cut; its key must not match the node that gets the id next
+        _cutKeys.RemoveWhere(k => ReferenceEquals(k.Session, session) && _reclaimSet.Contains(k.NodeId));
+
+        store.ReturnReclaimable(_reclaimIds.Where(_reclaimReferenced.Contains).ToList());
+        List<int> safe = _reclaimIds.Where(id => !_reclaimReferenced.Contains(id)).ToList();
+        store.CommitReclaim(safe);
+        session.ForgetActivity(safe);
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool IsWindowEnabled(IntPtr hWnd);
+
+    /// <summary>False while a modal dialog owned by the window is open (the dialog disables its owner).</summary>
+    private bool IsMainWindowEnabled()
+    {
+        IntPtr handle = new WindowInteropHelper(this).Handle;
+        return handle == IntPtr.Zero || IsWindowEnabled(handle);
+    }
+
+    /// <summary>Refreshes every row of the drive (and brings its rows in line with the store): used after the store was changed outside the live updates.</summary>
+    private void RefreshSessionRows(DriveSession session)
+    {
+        FileSystemStore? store = session.Store;
+        if (store == null || !TryGetSessionBlock(session, out int start, out int end))
+            return;
+
+        _syncSession = session;
+        _syncStore = store;
+        RowSync.Apply(_visibleRows, start, end, store, null, out _);
+        RefreshRootRow(session);
     }
 
     /// <summary>Totals of the drive of the selected row (else the first drive).</summary>
@@ -1977,7 +1975,7 @@ public partial class MainWindow : Window
             TotalEventsProcessed = (session.Monitor?.TotalEventsProcessed ?? 0) + 1,
             LastChangedItem = itemName,
             IsUsnJournalMode = session.Monitor?.IsUsnJournalActive ?? false
-        });
+        }, full: true);
     }
 
     // =========================================================================

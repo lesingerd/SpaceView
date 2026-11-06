@@ -206,6 +206,23 @@ public sealed class TreeRowViewModel : INotifyPropertyChanged
         }
     }
 
+    /// <summary>
+    /// <see cref="Environment.TickCount64"/> of the last live-activity highlight, 0 if there never was one. The row template
+    /// plays the fade from it (see <see cref="RowPulse"/>), so a container realized or recycled later joins or skips the
+    /// fade according to how old the stamp is.
+    /// </summary>
+    public long ActivityStamp { get; private set; }
+
+    /// <summary>Starts (or restarts) the activity highlight at <paramref name="tick"/>.</summary>
+    public void Pulse(long tick)
+    {
+        if (ActivityStamp != tick)
+        {
+            ActivityStamp = tick;
+            OnPropertyChanged(nameof(ActivityStamp));
+        }
+    }
+
     public string? ToolTipText
     {
         get => _toolTipText;

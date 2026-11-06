@@ -299,13 +299,21 @@
                         <Setter Property="Template">
                             <Setter.Value>
                                 <ControlTemplate TargetType="ListBoxItem">
-                                    <Border x:Name="RowBorder"
-                                            Background="{TemplateBinding Background}"
-                                            BorderBrush="{TemplateBinding BorderBrush}"
-                                            BorderThickness="{TemplateBinding BorderThickness}"
-                                            Padding="{TemplateBinding Padding}">
-                                        <ContentPresenter/>
-                                    </Border>
+                                    <Grid>
+                                        <Border x:Name="RowBorder"
+                                                Background="{TemplateBinding Background}"
+                                                BorderBrush="{TemplateBinding BorderBrush}"
+                                                BorderThickness="{TemplateBinding BorderThickness}"
+                                                Padding="{TemplateBinding Padding}">
+                                            <ContentPresenter/>
+                                        </Border>
+                                        <!-- Live-activity highlight: a translucent accent layer over the row, faded by RowPulse. At opacity 0 it is invisible, and it never takes the mouse. -->
+                                        <Border x:Name="ActivityOverlay"
+                                                Background="#5938BDF8"
+                                                Opacity="0"
+                                                IsHitTestVisible="False"
+                                                models:RowPulse.Stamp="{Binding ActivityStamp, Mode=OneWay}"/>
+                                    </Grid>
                                     <ControlTemplate.Triggers>
                                         <Trigger Property="IsMouseOver" Value="True">
                                             <Setter TargetName="RowBorder" Property="Background" Value="#1E293B"/>

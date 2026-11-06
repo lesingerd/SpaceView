@@ -28,6 +28,8 @@ public sealed class DriveSession : IDisposable
     private CancellationTokenSource? _scanCts;
     private int _uiRefreshPending;
     private UsnMonitorEventArgs? _latestUsnArgs;
+    private readonly object _activityLock = new();
+    private HashSet<int> _pendingActivity = new();
 
     private NtfsUsnJournalMonitor? _monitor;
     private EventHandler<UsnMonitorEventArgs>? _onChanges;
@@ -141,6 +143,7 @@ public sealed class DriveSession : IDisposable
     public void ApplyScanResult(ScanResult result)
     {
         Store = result.Store;
+        ClearActivity(); // node ids of the previous store mean nothing in this one
         IsNtfs = result.IsNtfs;
         InaccessibleDirectories = result.InaccessibleDirectories;
         ScanDuration = result.Duration;
@@ -204,6 +207,51 @@ public sealed class DriveSession : IDisposable
     {
         Interlocked.Exchange(ref _uiRefreshPending, 0);
         return Volatile.Read(ref _latestUsnArgs);
+    }
+
+    /// <summary>
+    /// Called from a monitor thread for every change batch, before <see cref="TryBeginUiRefresh"/>: adds the batch's
+    /// changed nodes to those waiting for the next UI pass, so none is lost when passes are coalesced. Batches from a
+    /// monitor that is no longer this session's are ignored. Bounded by <see cref="FileSystemStore.MaxActivityNodes"/>.
+    /// </summary>
+    public void AddActivity(NtfsUsnJournalMonitor monitor, IReadOnlyCollection<int> nodes)
+    {
+        if (nodes.Count == 0)
+            return;
+
+        lock (_activityLock)
+        {
+            if (!ReferenceEquals(Volatile.Read(ref _monitor), monitor))
+                return;
+
+            foreach (int node in nodes)
+            {
+                if (_pendingActivity.Count >= FileSystemStore.MaxActivityNodes)
+                    break;
+                _pendingActivity.Add(node);
+            }
+        }
+    }
+
+    /// <summary>Hands the nodes collected since the last pass to the UI pass (UI thread) and starts collecting again.</summary>
+    public HashSet<int> TakeActivity()
+    {
+        lock (_activityLock)
+        {
+            HashSet<int> taken = _pendingActivity;
+            if (taken.Count > 0)
+                _pendingActivity = new HashSet<int>();
+            return taken;
+        }
+    }
+
+    /// <summary>Forgets the collected nodes (the store was replaced or a branch was grafted: they no longer describe live changes).</summary>
+    public void ClearActivity()
+    {
+        lock (_activityLock)
+        {
+            _pendingActivity.Clear();
+        }
     }
 
     // ------------------------------------------------------------------

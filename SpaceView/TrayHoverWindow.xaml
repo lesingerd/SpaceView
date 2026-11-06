@@ -11,6 +11,20 @@
         ShowInTaskbar="False"
         ResizeMode="NoResize"
         ShowActivated="False">
+    <Window.Resources>
+        <!-- Capacity bar track/indicator used by the page file bars -->
+        <ControlTemplate x:Key="PageFileBarTemplate" TargetType="ProgressBar">
+            <Border Background="{TemplateBinding Background}" CornerRadius="4" ClipToBounds="True">
+                <Grid>
+                    <Rectangle x:Name="PART_Track"/>
+                    <Border x:Name="PART_Indicator"
+                            HorizontalAlignment="Left"
+                            Background="{TemplateBinding Foreground}"
+                            CornerRadius="4"/>
+                </Grid>
+            </Border>
+        </ControlTemplate>
+    </Window.Resources>
     <Grid>
         <Border Margin="10"
                 Background="#111827"
@@ -107,6 +121,57 @@
                     </DataTemplate>
                 </ItemsControl.ItemTemplate>
             </ItemsControl>
+
+            <!-- Page file section (hidden when there is no page file or WMI has not answered) -->
+            <StackPanel x:Name="PageFileSection" Visibility="Collapsed">
+                <Border Height="1" Background="#1E293B" Margin="0,1,0,8"/>
+                <TextBlock Text="Page file"
+                           Foreground="#F8FAFC"
+                           FontWeight="SemiBold"
+                           FontSize="12"
+                           Margin="0,0,0,6"/>
+                <ItemsControl x:Name="PageFilesItemsControl">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Border Background="#1E293B"
+                                    CornerRadius="7"
+                                    Padding="10,8"
+                                    Margin="0,0,0,7">
+                                <StackPanel>
+                                    <TextBlock Text="{Binding Name}"
+                                               Foreground="#F1F5F9"
+                                               FontWeight="SemiBold"
+                                               FontSize="12"
+                                               TextTrimming="CharacterEllipsis"
+                                               Margin="0,0,0,5"/>
+
+                                    <!-- Allocated size = 100%; light underlay = peak, solid fill = current usage -->
+                                    <Grid Height="8">
+                                        <ProgressBar Minimum="0" Maximum="100"
+                                                     Value="{Binding PeakPercentage, Mode=OneWay}"
+                                                     Background="#0F172A"
+                                                     Foreground="#7DD3FC"
+                                                     BorderThickness="0"
+                                                     Template="{StaticResource PageFileBarTemplate}"/>
+                                        <ProgressBar Minimum="0" Maximum="100"
+                                                     Value="{Binding CurrentPercentage, Mode=OneWay}"
+                                                     Background="Transparent"
+                                                     Foreground="#38BDF8"
+                                                     BorderThickness="0"
+                                                     Template="{StaticResource PageFileBarTemplate}"/>
+                                    </Grid>
+
+                                    <TextBlock Text="{Binding SummaryText}"
+                                               Foreground="#94A3B8"
+                                               FontSize="10.5"
+                                               TextWrapping="Wrap"
+                                               Margin="0,4,0,0"/>
+                                </StackPanel>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </StackPanel>
         </StackPanel>
         </Border>
     </Grid>

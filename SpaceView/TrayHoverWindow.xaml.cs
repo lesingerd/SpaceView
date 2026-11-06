@@ -19,8 +19,17 @@ public partial class TrayHoverWindow : Window
     public void RefreshAndPositionNearCursor()
     {
         DrivesItemsControl.ItemsSource = DriveItemViewModel.LastResult.Drives;
+        ShowPageFiles(PageFileViewModel.LastResult);
         PositionNearCursor();
         _ = RefreshDrivesAsync();
+    }
+
+    /// <summary>Shows the page files cached by the background refresh (the popup never queries); hides the section when there are none.</summary>
+    private void ShowPageFiles(IReadOnlyList<PageFileViewModel> pageFiles)
+    {
+        if (!ReferenceEquals(PageFilesItemsControl.ItemsSource, pageFiles))
+            PageFilesItemsControl.ItemsSource = pageFiles;
+        PageFileSection.Visibility = pageFiles.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private async Task RefreshDrivesAsync()

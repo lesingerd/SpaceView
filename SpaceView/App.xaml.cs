@@ -1,5 +1,6 @@
 using System.Windows;
 using SpaceView.Core;
+using SpaceView.Models;
 
 namespace SpaceView;
 
@@ -12,5 +13,12 @@ public partial class App : System.Windows.Application
     {
         StartupOptions = StartupOptions.Parse(e.Args);
         base.OnStartup(e);
+        PageFileViewModel.StartBackgroundRefresh();
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        PageFileViewModel.StopBackgroundRefresh();
+        base.OnExit(e);
     }
 }

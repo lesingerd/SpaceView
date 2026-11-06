@@ -47,6 +47,7 @@ When launched, SpaceView presents a drive selector drop-down displaying all read
 SpaceView/
 ├── SpaceView.sln                        # Visual Studio 2022 Solution
 ├── install.ps1 / install.bat            # Installer script (publishes to LocalAppData & creates Start Menu icon)
+├── build.ps1 / build.bat                # Build script (publishes to artifacts\publish)
 ├── uninstall.ps1 / uninstall.bat        # Uninstaller script
 ├── Screenshot.png                       # Main application screenshot
 ├── Screenshot_Tray.png                  # System tray hover popup screenshot
@@ -89,6 +90,17 @@ This publishes the Release binaries to `%LOCALAPPDATA%\Programs\SpaceView`, regi
 - To also create a Desktop shortcut: `.\install.ps1 -CreateDesktopShortcut`
 - To install to a custom folder: `.\install.ps1 -InstallDir "C:\Tools\SpaceView"`
 - To uninstall: double-click `uninstall.bat` or run `.\uninstall.ps1`
+
+### Build (Publish Only)
+Double-click `build.bat` or run `build.ps1` to publish the Release binaries without installing, creating shortcuts, or launching anything:
+```powershell
+.\build.ps1
+```
+Output goes to `artifacts\publish` (git-ignored) and the script finishes with a summary of the output folder, `SpaceView.exe` path, file version, total size and git commit.
+
+- To build another configuration: `.\build.ps1 -Configuration Debug`
+- To publish elsewhere: `.\build.ps1 -OutputDir "C:\Temp\SpaceView"`
+- To wipe the output folder first: `.\build.ps1 -Clean` (only folders inside the repo's `artifacts` folder can be cleaned)
 
 ### Build & Run Manually via CLI
 ```powershell

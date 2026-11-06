@@ -1555,12 +1555,39 @@ public sealed class FileSystemStore
         if (name.IsEmpty || parentId < 0)
             return -1;
 
+        // The name is encoded once for the whole walk; a sibling is compared as bytes (exactly, or ignoring ASCII case),
+        // and only a pair with non-ASCII characters is decoded to a string, so a folder with tens of thousands of
+        // children is walked without allocating.
+        Span<byte> buffer = stackalloc byte[512];
+        bool encoded = Encoding.UTF8.GetMaxByteCount(name.Length) <= buffer.Length;
+        ReadOnlySpan<byte> target = encoded ? buffer[..Encoding.UTF8.GetBytes(name, buffer)] : default;
+        bool targetAscii = encoded && Ascii.IsValid(target);
+        string? targetString = null;
+
         int childId = GetNodeRef(parentId).FirstChildId;
         while (childId != -1)
         {
             ref NodeRecord child = ref GetNodeRef(childId);
-            if (!child.IsDeleted && NameEqualsUnsafe(childId, name))
-                return childId;
+            if (!child.IsDeleted)
+            {
+                if (encoded)
+                {
+                    ReadOnlySpan<byte> stored = _nameSlabs[child.NameHandle >> NameSlabShift].AsSpan(child.NameHandle & NameSlabMask, child.NameByteLength);
+                    if (stored.SequenceEqual(target))
+                        return childId;
+                    if (targetAscii && Ascii.IsValid(stored))
+                    {
+                        if (Ascii.EqualsIgnoreCase(stored, target))
+                            return childId;
+                        childId = child.NextSiblingId;
+                        continue;
+                    }
+                }
+
+                targetString ??= name.ToString();
+                if (string.Equals(GetNameUnsafe(childId), targetString, StringComparison.OrdinalIgnoreCase))
+                    return childId;
+            }
             childId = child.NextSiblingId;
         }
         return -1;

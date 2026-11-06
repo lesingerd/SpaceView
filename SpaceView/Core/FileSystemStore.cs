@@ -24,6 +24,7 @@ public struct NodeRecord
     public int ParentId;
     public int FirstChildId;
     public int NextSiblingId;
+    public int PrevSiblingId;
     public int FileCount;
     public int FolderCount;
     public int NameHandle;
@@ -114,13 +115,26 @@ public sealed class FileSystemStore
     // Guarded by _syncLock like every other mutation; capped so a busy volume cannot grow it without bound.
     private readonly HashSet<int> _activity = new();
 
+    // Node ids of deleted nodes. A deleted node is unlinked from its parent's child chain at once, but its id may only be
+    // reused when nothing can refer to it any more. Ids wait in _pendingFree (with the reclaim epoch of the delete) until
+    // the UI has completed two live-update passes since and found no row, cut key or other holder for them (see
+    // TakeReclaimable / CommitReclaim); then they move to _reusable, which AddNodeInternal draws from.
+    private readonly Queue<(int Id, int Epoch)> _pendingFree = new();
+    private readonly List<int> _reusable = new();
+    private int _reclaimEpoch;
+
     /// <summary>Most distinct nodes remembered between two <see cref="TakeActivity"/> calls (also kept per drive between UI passes, and resolved per pass).</summary>
     public const int MaxActivityNodes = 4096;
 
     public string RootPath { get; }
     public int RootNodeId => 0;
 
+    /// <summary>The highest node id ever handed out plus one (reused ids do not raise it).</summary>
     public int TotalNodeCount => Volatile.Read(ref _nodeCount);
+
+    /// <summary>Ids of deleted nodes waiting for the UI's go-ahead, and ids ready to be reused (for diagnostics and tests).</summary>
+    public int PendingFreeCount { get { lock (_syncLock) return _pendingFree.Count; } }
+    public int ReusableCount { get { lock (_syncLock) return _reusable.Count; } }
 
     /// <summary>
     /// A cheap estimate of the memory held by the store: the allocated node chunks, name slabs and FRN pages, plus a rough
@@ -190,10 +204,7 @@ public sealed class FileSystemStore
             int nodeId = AddAndMapNodeUnsafe(parentId, name, size, fileId, isDirectory);
             if (linkToParent && parentId >= 0)
             {
-                ref NodeRecord parent = ref GetNodeRef(parentId);
-                ref NodeRecord child = ref GetNodeRef(nodeId);
-                child.NextSiblingId = parent.FirstChildId;
-                parent.FirstChildId = nodeId;
+                LinkChildUnsafe(parentId, nodeId);
             }
             return nodeId;
         }
@@ -214,26 +225,17 @@ public sealed class FileSystemStore
 
         lock (_syncLock)
         {
-            ref NodeRecord parent = ref GetNodeRef(parentId);
-            int firstChild = parent.FirstChildId;
-
             for (int i = 0; i < entries.Length; i++)
             {
                 ref readonly PendingChildEntry entry = ref entries[i];
                 int nodeId = AddAndMapNodeUnsafe(parentId, entry.Name.AsSpan(), entry.Size, entry.FileId, entry.IsDirectory);
-
-                // Re-fetch parent ref in case _chunks grew
-                ref NodeRecord child = ref GetNodeRef(nodeId);
-                child.NextSiblingId = firstChild;
-                firstChild = nodeId;
+                LinkChildUnsafe(parentId, nodeId);
 
                 if (entry.IsDirectory)
                 {
                     outCreatedDirNodeIds[createdDirCount++] = nodeId;
                 }
             }
-
-            GetNodeRef(parentId).FirstChildId = firstChild;
         }
     }
 
@@ -304,7 +306,10 @@ public sealed class FileSystemStore
             GetNodeRef(heirId).Size = size;
             MapFileIdInternal(fileId, heirId);
             if (size != 0)
+            {
                 PropagateDeltaUnsafe(GetNodeRef(heirId).ParentId, size, 0, 0);
+                NoteActivityUnsafe(heirId); // its size changed: the UI refreshes it and its ancestors
+            }
         }
 
         if (group.Count < 2)
@@ -318,9 +323,60 @@ public sealed class FileSystemStore
         return childId > 0 && GetNodeRef(childId).FileId == fileId ? childId : -1;
     }
 
+    /// <summary>Makes <paramref name="childId"/> the first child of <paramref name="parentId"/>.</summary>
+    private void LinkChildUnsafe(int parentId, int childId)
+    {
+        ref NodeRecord parent = ref GetNodeRef(parentId);
+        ref NodeRecord child = ref GetNodeRef(childId);
+        int head = parent.FirstChildId;
+        child.NextSiblingId = head;
+        child.PrevSiblingId = -1;
+        if (head != -1)
+            GetNodeRef(head).PrevSiblingId = childId;
+        parent.FirstChildId = childId;
+    }
+
+    /// <summary>Takes a node out of its parent's child chain in O(1). Its ParentId is kept. Does nothing if it is not linked.</summary>
+    private void UnlinkChildUnsafe(int nodeId)
+    {
+        ref NodeRecord node = ref GetNodeRef(nodeId);
+        int parentId = node.ParentId;
+        if (parentId < 0)
+            return;
+
+        int next = node.NextSiblingId;
+        int prev = node.PrevSiblingId;
+        if (prev != -1)
+        {
+            GetNodeRef(prev).NextSiblingId = next;
+        }
+        else if (GetNodeRef(parentId).FirstChildId == nodeId)
+        {
+            GetNodeRef(parentId).FirstChildId = next;
+        }
+        else
+        {
+            return; // not on the chain
+        }
+
+        if (next != -1)
+            GetNodeRef(next).PrevSiblingId = prev;
+        node.NextSiblingId = -1;
+        node.PrevSiblingId = -1;
+    }
+
     private int AddNodeInternal(int parentId, ReadOnlySpan<char> name, long size, ulong fileId, bool isDirectory)
     {
-        int nodeId = _nodeCount++;
+        int nodeId;
+        if (_reusable.Count > 0)
+        {
+            nodeId = _reusable[^1];
+            _reusable.RemoveAt(_reusable.Count - 1);
+        }
+        else
+        {
+            nodeId = _nodeCount++;
+        }
         int chunkIdx = nodeId >> ChunkShift;
         int offsetIdx = nodeId & ChunkMask;
 
@@ -341,6 +397,7 @@ public sealed class FileSystemStore
         rec.ParentId = parentId;
         rec.FirstChildId = -1;
         rec.NextSiblingId = -1;
+        rec.PrevSiblingId = -1;
         rec.FileCount = 0;
         rec.FolderCount = 0;
         rec.NameHandle = nameHandle;
@@ -391,6 +448,28 @@ public sealed class FileSystemStore
         lock (_syncLock)
         {
             return GetNameUnsafe(nodeId);
+        }
+    }
+
+    /// <summary>True if the node's name is exactly <paramref name="name"/> (case-sensitive, no allocation for ordinary names).</summary>
+    public bool NameIs(int nodeId, string name)
+    {
+        lock (_syncLock)
+        {
+            ref NodeRecord rec = ref GetNodeRef(nodeId);
+            if (nodeId == 0)
+                return name == RootPath;
+            if (rec.NameByteLength == 0)
+                return name.Length == 0;
+
+            Span<byte> buffer = stackalloc byte[512];
+            if (Encoding.UTF8.GetMaxByteCount(name.Length) <= buffer.Length)
+            {
+                int len = Encoding.UTF8.GetBytes(name, buffer);
+                ReadOnlySpan<byte> stored = _nameSlabs[rec.NameHandle >> NameSlabShift].AsSpan(rec.NameHandle & NameSlabMask, rec.NameByteLength);
+                return stored.SequenceEqual(buffer[..len]);
+            }
+            return string.Equals(GetNameUnsafe(nodeId), name, StringComparison.Ordinal);
         }
     }
 
@@ -751,6 +830,169 @@ public sealed class FileSystemStore
     }
 
     // =========================================================================
+    // Cheap bulk reads for the live row sync (no sorting, no strings)
+    // =========================================================================
+
+    /// <summary>
+    /// The numbers a row shows for each id, read under one lock without allocating. An id that is out of range or
+    /// deleted comes back with <see cref="NodeRowValues.Deleted"/> set (the parent link of a deleted node is kept).
+    /// </summary>
+    public void ReadRowValues(ReadOnlySpan<int> ids, Span<NodeRowValues> output)
+    {
+        lock (_syncLock)
+        {
+            for (int i = 0; i < ids.Length; i++)
+            {
+                int id = ids[i];
+                if (id < 0 || id >= _nodeCount)
+                {
+                    output[i] = new NodeRowValues { ParentId = -1, Deleted = true };
+                    continue;
+                }
+
+                ref NodeRecord rec = ref GetNodeRef(id);
+                output[i] = new NodeRowValues
+                {
+                    Size = rec.Size,
+                    ParentSize = rec.ParentId >= 0 ? GetNodeRef(rec.ParentId).Size : 0,
+                    FileCount = rec.FileCount,
+                    FolderCount = rec.FolderCount,
+                    ParentId = rec.ParentId,
+                    IsDirectory = rec.IsDirectory,
+                    Deleted = rec.IsDeleted
+                };
+            }
+        }
+    }
+
+    /// <summary>Number of live children of a directory (a walk of its child chain, which holds live children only).</summary>
+    public int CountLiveChildren(int parentId)
+    {
+        lock (_syncLock)
+        {
+            int count = 0;
+            for (int c = GetNodeRef(parentId).FirstChildId; c != -1; c = GetNodeRef(c).NextSiblingId)
+            {
+                if (!GetNodeRef(c).IsDeleted)
+                    count++;
+            }
+            return count;
+        }
+    }
+
+    /// <summary>Appends (id, size) of every live child of a directory, in chain order, and returns how many there are.</summary>
+    public int CopyLiveChildren(int parentId, List<(int Id, long Size)> results)
+    {
+        lock (_syncLock)
+        {
+            int count = 0;
+            for (int c = GetNodeRef(parentId).FirstChildId; c != -1; c = GetNodeRef(c).NextSiblingId)
+            {
+                ref NodeRecord rec = ref GetNodeRef(c);
+                if (!rec.IsDeleted)
+                {
+                    results.Add((c, rec.Size));
+                    count++;
+                }
+            }
+            return count;
+        }
+    }
+
+    /// <summary>
+    /// Adds every id and all its ancestors (through the kept parent links, deleted nodes included) to
+    /// <paramref name="into"/>. A chain stops at the first id that is already in the set, which must therefore only
+    /// ever be filled by this method.
+    /// </summary>
+    public void AddWithAncestors(IEnumerable<int> ids, HashSet<int> into)
+    {
+        lock (_syncLock)
+        {
+            foreach (int start in ids)
+            {
+                int id = start;
+                for (int steps = 0; id >= 0 && id < _nodeCount && steps < 4096; steps++)
+                {
+                    if (!into.Add(id))
+                        break;
+                    id = GetNodeRef(id).ParentId;
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // Reuse of node ids
+    // =========================================================================
+
+    /// <summary>Starts a new reclaim epoch. The UI calls it at the start of every live-update pass.</summary>
+    public void AdvanceReclaimEpoch()
+    {
+        lock (_syncLock)
+        {
+            _reclaimEpoch++;
+        }
+    }
+
+    /// <summary>
+    /// Moves the ids that were deleted at least two epochs ago into <paramref name="into"/> and returns how many. They
+    /// are not reusable yet: the caller checks that no row, cut key or other holder still refers to them, then hands the
+    /// safe ones to <see cref="CommitReclaim"/> and the others back with <see cref="ReturnReclaimable"/>.
+    /// </summary>
+    public int TakeReclaimable(List<int> into)
+    {
+        lock (_syncLock)
+        {
+            int taken = 0;
+            while (_pendingFree.Count > 0 && _pendingFree.Peek().Epoch <= _reclaimEpoch - 2)
+            {
+                into.Add(_pendingFree.Dequeue().Id);
+                taken++;
+            }
+            return taken;
+        }
+    }
+
+    /// <summary>Puts ids that something still refers to back to wait for a later epoch.</summary>
+    public void ReturnReclaimable(IEnumerable<int> ids)
+    {
+        lock (_syncLock)
+        {
+            foreach (int id in ids)
+                _pendingFree.Enqueue((id, _reclaimEpoch));
+        }
+    }
+
+    /// <summary>
+    /// Makes ids reusable. The caller guarantees nothing it owns refers to them. Here the store's own references are
+    /// dropped: the FRN map slot of the node (so a lookup can never land on the id's next owner), and the id in the
+    /// activity set. A file that is one name of a hard-linked file keeps its id out of circulation for good, because
+    /// link groups and the carrier hand-over keep ids of deleted names.
+    /// </summary>
+    public void CommitReclaim(IEnumerable<int> ids)
+    {
+        lock (_syncLock)
+        {
+            foreach (int id in ids)
+            {
+                if (id <= 0 || id >= _nodeCount)
+                    continue;
+
+                ref NodeRecord rec = ref GetNodeRef(id);
+                if (!rec.IsDeleted)
+                    continue; // already reused or never deleted: nothing to do
+
+                if (!rec.IsDirectory && rec.FileId != 0 && _linkGroups.ContainsKey(rec.FileId))
+                    continue;
+
+                UnmapFileIdInternal(rec.FileId, id);
+                _activity.Remove(id);
+                _reusable.Add(id);
+            }
+        }
+    }
+
+    // =========================================================================
     // Real-time NTFS USN Journal Incremental Mutation Operations
     // =========================================================================
 
@@ -822,9 +1064,7 @@ public sealed class FileSystemStore
                         FindLinkByNameUnsafe(newParentId, fileName, fileId) < 0)
                     {
                         int linkId = AddNodeInternal(newParentId, fileName, 0, fileId, isDirectory: false);
-                        ref NodeRecord parentRec = ref GetNodeRef(newParentId);
-                        GetNodeRef(linkId).NextSiblingId = parentRec.FirstChildId;
-                        parentRec.FirstChildId = linkId;
+                        LinkChildUnsafe(newParentId, linkId);
                         RegisterLinkUnsafe(fileId, existingNodeId, linkId);
                         PropagateDeltaUnsafe(newParentId, 0, 1, 0);
                         NoteActivityUnsafe(linkId);
@@ -906,10 +1146,7 @@ public sealed class FileSystemStore
 
                 long initialSize = isDirectory || !sizeKnown ? 0 : newFileSize;
                 int nodeId = AddNodeInternal(parentNodeId, fileName, initialSize, fileId, isDirectory);
-                ref NodeRecord parent = ref GetNodeRef(parentNodeId);
-                ref NodeRecord child = ref GetNodeRef(nodeId);
-                child.NextSiblingId = parent.FirstChildId;
-                parent.FirstChildId = nodeId;
+                LinkChildUnsafe(parentNodeId, nodeId);
 
                 if (fileId != 0)
                     MapFileIdInternal(fileId, nodeId);
@@ -1026,6 +1263,9 @@ public sealed class FileSystemStore
 
         TombstoneSubtreeUnsafe(nodeId);
 
+        // Out of the parent's chain at once, so walks stay as long as the live children; descendants are unreachable
+        UnlinkChildUnsafe(nodeId);
+
         PropagateDeltaUnsafe(parentId, -removedSize, -removedFiles, -removedFolders);
     }
 
@@ -1049,7 +1289,11 @@ public sealed class FileSystemStore
                 continue;
 
             if (id != nodeId || includeRoot)
+            {
                 rec.Flags |= NodeRecord.FlagDeleted;
+                if (id > 0)
+                    _pendingFree.Enqueue((id, _reclaimEpoch));
+            }
 
             int childId = rec.FirstChildId;
             while (childId != -1)
@@ -1146,7 +1390,6 @@ public sealed class FileSystemStore
         {
             (int scratchDirId, int newDirId) = pending.Dequeue();
 
-            int firstChild = -1;
             int scratchChildId = scratch.GetNodeRef(scratchDirId).FirstChildId;
             while (scratchChildId != -1)
             {
@@ -1165,14 +1408,11 @@ public sealed class FileSystemStore
                 }
 
                 int newId = AddAndMapNodeUnsafe(newDirId, scratch.GetNameUnsafe(currentScratchId), size, sc.FileId, sc.IsDirectory);
-                GetNodeRef(newId).NextSiblingId = firstChild;
-                firstChild = newId;
+                LinkChildUnsafe(newDirId, newId);
 
                 if (sc.IsDirectory)
                     pending.Enqueue((currentScratchId, newId));
             }
-
-            GetNodeRef(newDirId).FirstChildId = firstChild;
         }
     }
 
@@ -1202,8 +1442,7 @@ public sealed class FileSystemStore
 
             bool isDirectory = scratch != null;
             int newId = AddAndMapNodeUnsafe(parentId, name, isDirectory ? 0 : fileSize, fileId, isDirectory);
-            GetNodeRef(newId).NextSiblingId = GetNodeRef(parentId).FirstChildId;
-            GetNodeRef(parentId).FirstChildId = newId;
+            LinkChildUnsafe(parentId, newId);
 
             if (scratch != null)
             {
@@ -1296,23 +1535,7 @@ public sealed class FileSystemStore
         if (oldParentId == newParentId || oldParentId < 0)
             return;
 
-        // Unlink from oldParentId's FirstChildId linked list
-        ref NodeRecord oldParent = ref GetNodeRef(oldParentId);
-        int prev = -1;
-        int curr = oldParent.FirstChildId;
-        while (curr != -1)
-        {
-            if (curr == nodeId)
-            {
-                if (prev == -1)
-                    oldParent.FirstChildId = node.NextSiblingId;
-                else
-                    GetNodeRef(prev).NextSiblingId = node.NextSiblingId;
-                break;
-            }
-            prev = curr;
-            curr = GetNodeRef(curr).NextSiblingId;
-        }
+        UnlinkChildUnsafe(nodeId);
 
         long movedSize = node.Size;
         int movedFiles = node.IsDirectory ? node.FileCount : 1;
@@ -1321,10 +1544,8 @@ public sealed class FileSystemStore
         PropagateDeltaUnsafe(oldParentId, -movedSize, -movedFiles, -movedFolders);
 
         // Link to newParentId
-        ref NodeRecord newParent = ref GetNodeRef(newParentId);
         node.ParentId = newParentId;
-        node.NextSiblingId = newParent.FirstChildId;
-        newParent.FirstChildId = nodeId;
+        LinkChildUnsafe(newParentId, nodeId);
 
         PropagateDeltaUnsafe(newParentId, movedSize, movedFiles, movedFolders);
     }
@@ -1374,4 +1595,17 @@ public readonly struct PendingChildEntry
         FileId = fileId;
         IsDirectory = isDirectory;
     }
+}
+
+/// <summary>What a row shows, read cheaply for many nodes at once (see <see cref="FileSystemStore.ReadRowValues"/>).</summary>
+public struct NodeRowValues
+{
+    public long Size;
+    /// <summary>Size of the parent directory (0 for the root); the denominator for the node's percentage.</summary>
+    public long ParentSize;
+    public int FileCount;
+    public int FolderCount;
+    public int ParentId;
+    public bool IsDirectory;
+    public bool Deleted;
 }

@@ -29,7 +29,8 @@ if (Test-Path $iconGenScript) {
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
     $OutputDir = Join-Path $repoRoot "artifacts\publish"
 }
-$OutputDir = [System.IO.Path]::GetFullPath($OutputDir).TrimEnd('\')
+# Resolve against the PowerShell location (not the .NET process directory) so relative paths behave as typed
+$OutputDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDir).TrimEnd('\')
 
 # 1. Optionally clean the output folder (only ever inside a SpaceView "artifacts" folder)
 if ($Clean) {

@@ -394,7 +394,7 @@ public sealed class DriveSession : IDisposable
         $"Monitor: {MonitorModeText}" +
         (IsStale ? $"\nStale: {StaleReason}" : string.Empty) +
         (!string.IsNullOrEmpty(MonitorProblem) ? $"\n{MonitorProblem}" : string.Empty) +
-        (Store != null ? $"\nLast scan: {ScanDuration.TotalSeconds:0.0}s, ~{SizeFormatter.FormatBytes(EstimatedMemoryBytes)} in memory" : string.Empty) +
+        (Store != null ? $"\nLast scan: {SizeFormatter.FormatDuration(ScanDuration)}, ~{SizeFormatter.FormatBytes(EstimatedMemoryBytes)} in memory" : string.Empty) +
         (InaccessibleDirectories > 0 ? $"\n{InaccessibleDirectories:N0} inaccessible folder(s) skipped" : string.Empty);
 
     /// <summary>Approximate memory held by this drive's store (0 before the first scan).</summary>

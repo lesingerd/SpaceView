@@ -21,6 +21,11 @@ public sealed class ScanResult
     public bool UsnJournalReady { get; init; }
     public ulong UsnJournalId { get; init; }
     public long StartUsn { get; init; }
+    /// <summary>
+    /// Journal changes read while the scan ran, and the position to continue from (null when no drain ran). The monitor
+    /// of the new tree applies them first; see <see cref="UsnJournalDrainer"/>.
+    /// </summary>
+    internal UsnJournalBacklog? UsnBacklog { get; init; }
     /// <summary>Directories that could not be listed (or only partly); their contents are missing from the store.</summary>
     public int InaccessibleDirectories { get; init; }
 }
@@ -140,17 +145,19 @@ public static class VolumeScanner
     /// <summary>
     /// How many scan workers to run for the volume holding <paramref name="path"/>. The system volume gets fewer: it
     /// carries the most filter drivers (antivirus, anti-cheat, backup, cloud sync, VSS), and more concurrent directory
-    /// opens only lengthen the time its volume locks are contended without making the scan finish sooner.
+    /// opens only lengthen the time its volume locks are contended without making the scan finish sooner. The system-wide
+    /// freeze that this limit answers only occurred when not elevated, so an elevated scan gets more workers.
     /// </summary>
-    internal static int GetScanWorkerCount(string path)
+    internal static int GetScanWorkerCount(string path, bool? elevated = null)
     {
+        const int SystemVolumeWorkersElevated = 4;
         const int SystemVolumeWorkers = 2;
         try
         {
             string? root = Path.GetPathRoot(Path.GetFullPath(path));
             string? systemRoot = Path.GetPathRoot(Environment.SystemDirectory);
             if (root != null && systemRoot != null && string.Equals(root, systemRoot, StringComparison.OrdinalIgnoreCase))
-                return SystemVolumeWorkers;
+                return (elevated ?? ElevationHelper.IsElevated) ? SystemVolumeWorkersElevated : SystemVolumeWorkers;
         }
         catch
         {
@@ -161,6 +168,15 @@ public static class VolumeScanner
 
     /// <summary>Test hook: runs on each scan worker thread right after it has entered background mode.</summary>
     internal static Action? WorkerStartedHook { get; set; }
+
+    /// <summary>Test hook: runs on a scan worker before it lists a directory (it may block to hold the scan at that point).</summary>
+    internal static Action<string>? DirectoryListingHook { get; set; }
+
+    /// <summary>Test hook: replaces the journal query of a drive scan (needs administrator rights otherwise). Returns the journal ID and next USN, or null for no journal.</summary>
+    internal static Func<string, (ulong JournalId, long NextUsn)?>? JournalQueryHook { get; set; }
+
+    /// <summary>Test hook: replaces the volume source the journal drain reads from.</summary>
+    internal static Func<string, ulong, IUsnRecordSource?>? DrainSourceHook { get; set; }
 
     static VolumeScanner()
     {
@@ -225,8 +241,62 @@ public static class VolumeScanner
 
         if (isNtfs)
         {
-            usnReady = TryQueryOrCreateUsnJournal(rootPath, out usnJournalId, out startUsn);
+            if (JournalQueryHook is { } queryHook)
+            {
+                (ulong JournalId, long NextUsn)? hooked = queryHook(rootPath);
+                usnReady = hooked != null;
+                usnJournalId = hooked?.JournalId ?? 0;
+                startUsn = hooked?.NextUsn ?? 0;
+            }
+            else
+            {
+                usnReady = TryQueryOrCreateUsnJournal(rootPath, out usnJournalId, out startUsn);
+            }
         }
+
+        // Read the journal while the tree is scanned: on a big, busy volume it can wrap before the scan is done, and the
+        // monitor only starts afterwards. Null when the volume cannot be read; the monitor then starts from startUsn as before.
+        UsnJournalDrainer? drainer = null;
+        if (usnReady)
+        {
+            if (DrainSourceHook is { } sourceHook)
+            {
+                IUsnRecordSource? source = sourceHook(rootPath, usnJournalId);
+                if (source != null)
+                {
+                    drainer = new UsnJournalDrainer(source, usnJournalId, startUsn);
+                    drainer.Start();
+                }
+            }
+            else
+            {
+                drainer = UsnJournalDrainer.StartForVolume(rootPath, usnJournalId, startUsn);
+            }
+        }
+
+        try
+        {
+            return ScanTree(rootPath, isNtfs, progress, cancellationToken, counters, sw, usnReady, usnJournalId, startUsn, drainer);
+        }
+        finally
+        {
+            // Cancelled or failed: stop the drain and release its volume handle (a no-op after Complete)
+            drainer?.Dispose();
+        }
+    }
+
+    private static ScanResult ScanTree(
+        string rootPath,
+        bool isNtfs,
+        IProgress<ScanProgressReport>? progress,
+        CancellationToken cancellationToken,
+        ScanCounters counters,
+        Stopwatch sw,
+        bool usnReady,
+        ulong usnJournalId,
+        long startUsn,
+        UsnJournalDrainer? drainer)
+    {
 
         ulong rootFileId = GetDirectoryFileId(rootPath);
         var store = new FileSystemStore(rootPath, rootFileId);
@@ -279,6 +349,9 @@ public static class VolumeScanner
         progressCts.Cancel();
         cancellationToken.ThrowIfCancellationRequested();
 
+        // The scan is complete: stop reading the journal and take what it collected (also drains what arrived last)
+        UsnJournalBacklog? backlog = drainer?.Complete();
+
         progress?.Report(new ScanProgressReport
         {
             ScannedNodes = store.TotalNodeCount,
@@ -297,6 +370,7 @@ public static class VolumeScanner
             UsnJournalReady = usnReady,
             UsnJournalId = usnJournalId,
             StartUsn = startUsn,
+            UsnBacklog = backlog,
             // An unlistable scan root is not counted by the workers (the branch scan reports it via RootListed)
             InaccessibleDirectories = counters.InaccessibleDirectories + (counters.RootListed ? 0 : 1)
         };
@@ -375,6 +449,8 @@ public static class VolumeScanner
     {
         if (ct.IsCancellationRequested)
             return;
+
+        DirectoryListingHook?.Invoke(dirPath);
 
         bool isScanRoot = dirNodeId == store.RootNodeId;
 

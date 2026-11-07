@@ -168,6 +168,8 @@ public partial class MainWindow : Window
     // Only one drive is scanned at a time (waiting scans show "queued"): several scans at once would thrash the disk
     private readonly SemaphoreSlim _scanGate = new(1, 1);
     private CancellationTokenSource? _branchCts; // non-null while a branch refresh is running
+    private bool _rowMenuOpen; // the row context menu is open
+    private bool _branchLoopRunning; // RefreshBranchesAsync is working through its folders
     private DriveSession? _branchSession;        // the session that branch refresh belongs to
     private bool _suppressDriveSelectionChanged; // set while the drive list is refreshed in place
     private bool _fileOperationInProgress;      // a delete or move (including the view update after it) is running: no second one starts
@@ -936,6 +938,9 @@ public partial class MainWindow : Window
         else
         {
             NodeRecord rec = store.GetNodeSnapshot(row.NodeId);
+            if (rec.IsDeleted)
+                return; // gone from the tree: its child chain may lead into reused ids
+
             if (rec.FileCount + rec.FolderCount > BackgroundExpandThreshold)
             {
                 _ = ExpandRowInBackgroundAsync(session, store, row);
@@ -996,6 +1001,9 @@ public partial class MainWindow : Window
         int rowIndex = _visibleRows.IndexOf(moreRow);
         if (rowIndex < 0)
             return;
+
+        if (store.GetNodeSnapshot(moreRow.ParentNodeId).IsDeleted)
+            return; // the folder is gone from the tree
 
         // The children of this folder that are on screen (the rows above this one, at its depth)
         var shown = new HashSet<int>();
@@ -1280,6 +1288,8 @@ public partial class MainWindow : Window
 
         ReclaimNodeIds(session, store, start, end);
 
+        ReleaseSyncReferences();
+
         // 5. Update top USN badge (it describes the first drive)
         if (_sessions.Count > 0 && ReferenceEquals(_sessions[0], session))
         {
@@ -1323,7 +1333,7 @@ public partial class MainWindow : Window
     private void ReclaimNodeIds(DriveSession session, FileSystemStore store, int start, int end)
     {
         if (store.PendingFreeCount < ReclaimBatchMin ||
-            _fileOperationInProgress || _branchCts != null || session.State != DriveSessionState.Ready || !IsMainWindowEnabled())
+            _fileOperationInProgress || _branchCts != null || _branchLoopRunning || _rowMenuOpen || session.State != DriveSessionState.Ready || !IsMainWindowEnabled())
         {
             return;
         }
@@ -1347,7 +1357,6 @@ public partial class MainWindow : Window
         store.ReturnReclaimable(_reclaimIds.Where(_reclaimReferenced.Contains).ToList());
         List<int> safe = _reclaimIds.Where(id => !_reclaimReferenced.Contains(id)).ToList();
         store.CommitReclaim(safe);
-        session.ForgetActivity(safe);
     }
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
@@ -1361,6 +1370,14 @@ public partial class MainWindow : Window
         return handle == IntPtr.Zero || IsWindowEnabled(handle);
     }
 
+    /// <summary>The row sync keeps the last synced store, session and rows only while it runs: a removed or rescanned drive's store must not stay alive through them.</summary>
+    private void ReleaseSyncReferences()
+    {
+        _syncSession = null;
+        _syncStore = null;
+        RowSync.ReleaseRows();
+    }
+
     /// <summary>Refreshes every row of the drive (and brings its rows in line with the store): used after the store was changed outside the live updates.</summary>
     private void RefreshSessionRows(DriveSession session)
     {
@@ -1372,6 +1389,7 @@ public partial class MainWindow : Window
         _syncStore = store;
         RowSync.Apply(_visibleRows, start, end, store, null, out _);
         RefreshRootRow(session);
+        ReleaseSyncReferences();
     }
 
     /// <summary>Totals of the drive of the selected row (else the first drive).</summary>
@@ -1512,7 +1530,17 @@ public partial class MainWindow : Window
         }
 
         // The "more items" row is not a file or folder: no menu action applies to it
-        return row is { IsMoreRow: false } ? row : null;
+        if (row is not { IsMoreRow: false })
+            return null;
+
+        // A row that left the list while the menu was open may carry a node id that has been reused since
+        if (!_visibleRows.Contains(row))
+        {
+            StatusTextBlock.Text = "That item is no longer shown.";
+            return null;
+        }
+
+        return row;
     }
 
     /// <summary>
@@ -1591,10 +1619,14 @@ public partial class MainWindow : Window
         }
     }
 
+    private void RowContextMenu_Closed(object sender, RoutedEventArgs e) => _rowMenuOpen = false;
+
     private void RowContextMenu_Opened(object sender, RoutedEventArgs e)
     {
         if (sender is not ContextMenu menu)
             return;
+
+        _rowMenuOpen = true; // the menu holds a row while it is open: no node id is reused meanwhile
 
         var row = (menu.PlacementTarget as FrameworkElement)?.DataContext as TreeRowViewModel;
         bool applies = row is { IsMoreRow: false };
@@ -2021,14 +2053,26 @@ public partial class MainWindow : Window
     {
         List<TreeRowViewModel> folders = GetRefreshableFolders(rows);
         int refreshed = 0;
-        foreach (TreeRowViewModel folder in folders)
+        _branchLoopRunning = true; // keeps node ids from being reused while the rows are held across awaits
+        try
         {
-            // The slot may have been taken meanwhile (a rescan, a delete): then the rest is not refreshed
-            if (!CanRefreshBranch(folder) || folder.Store is not { } store || !IsLive(folder.Session, store))
-                break;
+            foreach (TreeRowViewModel folder in folders)
+            {
+                // A row removed meanwhile may carry a reused node id
+                if (!_visibleRows.Contains(folder))
+                    continue;
 
-            if (await RefreshNodeBranchAsync(folder.Session, store, folder.NodeId))
-                refreshed++;
+                // The slot may have been taken meanwhile (a rescan, a delete): then the rest is not refreshed
+                if (!CanRefreshBranch(folder) || folder.Store is not { } store || !IsLive(folder.Session, store))
+                    break;
+
+                if (await RefreshNodeBranchAsync(folder.Session, store, folder.NodeId))
+                    refreshed++;
+            }
+        }
+        finally
+        {
+            _branchLoopRunning = false;
         }
 
         if (folders.Count > 1)
@@ -2401,7 +2445,7 @@ public partial class MainWindow : Window
             if (store == null)
                 continue;
 
-            nodeCount += store.TotalNodeCount;
+            nodeCount += store.LiveNodeCount;
             long bytes = store.EstimatedMemoryBytes;
             storeBytes += bytes;
             perDrive.Add($"{session.RootPath.TrimEnd('\\')} {SizeFormatter.FormatBytes(bytes)}");

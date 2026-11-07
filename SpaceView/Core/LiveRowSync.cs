@@ -131,6 +131,13 @@ public sealed class LiveRowSync<TRow> where TRow : class, ILiveRow
     /// </summary>
     public IReadOnlyDictionary<int, TRow> Displayed => _displayed;
 
+    /// <summary>Lets go of the rows kept from the last <see cref="Apply"/> (so they and their store can be collected).</summary>
+    public void ReleaseRows()
+    {
+        _displayed.Clear();
+        Array.Clear(_refreshRows);
+    }
+
     /// <summary>Largest first; equal sizes by node id (the order of <see cref="FileSystemStore.GetChildPage"/>).</summary>
     private static int CompareRank(long sizeA, int idA, long sizeB, int idB)
     {
@@ -400,8 +407,8 @@ public sealed class LiveRowSync<TRow> where TRow : class, ILiveRow
                 _ins.Add(_cands[c]);
         }
 
-        // With children hidden (or a full page shown), one that sorts after the last visible child stays hidden
-        if ((morePos >= 0 || _childPos.Count >= _pageSize) && _childPos.Count > 0 && _ins.Count > 0)
+        // With a full page shown, a new child that sorts after the last visible child stays hidden (counted by the "more items" row)
+        if (_childPos.Count >= _pageSize && _childPos.Count > 0 && _ins.Count > 0)
         {
             TRow last = rows[_childPos[^1]];
             long lastSize = last.Size;
@@ -430,8 +437,10 @@ public sealed class LiveRowSync<TRow> where TRow : class, ILiveRow
             else
                 _edits.Add(new Edit { Index = morePos, Kind = 1, Count = 1 });
         }
-        else if (remaining > 0)
+        else if (remaining > 0 && (allChildren || _childPos.Count >= _pageSize))
         {
+            // A folder shown in full has no hidden children: what the live count has beyond the listed rows are children not in
+            // the changed set of this pass (created since, or deferred), which the next pass lists
             _edits.Add(new Edit { Index = blockEnd, Kind = 2, Order = -childDepth, Seq = _seq++, Row = _createMoreRow(pRow.NodeId, childDepth, remaining) });
         }
     }

@@ -86,7 +86,7 @@
         </Style>
 
         <!-- Context Menu for Tree Rows -->
-        <ContextMenu x:Key="RowContextMenu" Background="#1E293B" Foreground="#F8FAFC" BorderBrush="#475569" BorderThickness="1" Opened="RowContextMenu_Opened">
+        <ContextMenu x:Key="RowContextMenu" Background="#1E293B" Foreground="#F8FAFC" BorderBrush="#475569" BorderThickness="1" Opened="RowContextMenu_Opened" Closed="RowContextMenu_Closed">
             <MenuItem Header="Open in Explorer" Tag="SingleOnly" Click="MenuOpenInExplorer_Click"/>
             <MenuItem Header="Copy Full Path" Click="MenuCopyPath_Click"/>
             <Separator Background="#334155"/>

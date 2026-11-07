@@ -96,6 +96,7 @@ public sealed class FileSystemStore
     private readonly object _syncLock = new();
     private NodeRecord[][] _chunks = new NodeRecord[64][];
     private int _nodeCount;
+    private int _liveCount; // nodes that are not deleted
 
     private readonly List<byte[]> _nameSlabs = new(32);
     private int _currentSlabIndex = -1;
@@ -129,8 +130,11 @@ public sealed class FileSystemStore
     public string RootPath { get; }
     public int RootNodeId => 0;
 
-    /// <summary>The highest node id ever handed out plus one (reused ids do not raise it).</summary>
+    /// <summary>The highest node id ever handed out plus one (a high-water mark: reused ids do not raise it, deleted nodes do not lower it).</summary>
     public int TotalNodeCount => Volatile.Read(ref _nodeCount);
+
+    /// <summary>The number of nodes that are not deleted.</summary>
+    public int LiveNodeCount => Volatile.Read(ref _liveCount);
 
     /// <summary>Ids of deleted nodes waiting for the UI's go-ahead, and ids ready to be reused (for diagnostics and tests).</summary>
     public int PendingFreeCount { get { lock (_syncLock) return _pendingFree.Count; } }
@@ -404,6 +408,7 @@ public sealed class FileSystemStore
         rec.NameByteLength = byteLen;
         rec.Flags = isDirectory ? NodeRecord.FlagDirectory : (byte)0;
         rec.Reserved = 0;
+        _liveCount++;
 
         return nodeId;
     }
@@ -789,6 +794,9 @@ public sealed class FileSystemStore
         lock (_syncLock)
         {
             ref NodeRecord parent = ref GetNodeRef(parentId);
+            if (parent.IsDeleted)
+                return 0; // its child chain may lead into reused ids
+
             long parentSize = parent.Size;
 
             int count = 0;
@@ -870,6 +878,9 @@ public sealed class FileSystemStore
     {
         lock (_syncLock)
         {
+            if (GetNodeRef(parentId).IsDeleted)
+                return 0; // its child chain may lead into reused ids
+
             int count = 0;
             for (int c = GetNodeRef(parentId).FirstChildId; c != -1; c = GetNodeRef(c).NextSiblingId)
             {
@@ -885,6 +896,9 @@ public sealed class FileSystemStore
     {
         lock (_syncLock)
         {
+            if (GetNodeRef(parentId).IsDeleted)
+                return 0; // its child chain may lead into reused ids
+
             int count = 0;
             for (int c = GetNodeRef(parentId).FirstChildId; c != -1; c = GetNodeRef(c).NextSiblingId)
             {
@@ -1291,6 +1305,7 @@ public sealed class FileSystemStore
             if (id != nodeId || includeRoot)
             {
                 rec.Flags |= NodeRecord.FlagDeleted;
+                _liveCount--;
                 if (id > 0)
                     _pendingFree.Enqueue((id, _reclaimEpoch));
             }

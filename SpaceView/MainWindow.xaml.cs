@@ -2144,7 +2144,16 @@ public partial class MainWindow : Window
                 StatusTextBlock.Text = rows.Count == 1
                     ? $"Moving {currentPath} to the Recycle Bin..."
                     : $"Moving {currentPath} to the Recycle Bin ({i + 1:N0} of {rows.Count:N0})...";
-                bool gone = await DeleteToRecycleBinAsync(currentPath, row.IsDirectory);
+                bool gone;
+                _shellOperationsRunning++;
+                try
+                {
+                    gone = await DeleteToRecycleBinAsync(currentPath, row.IsDirectory);
+                }
+                finally
+                {
+                    _shellOperationsRunning--;
+                }
 
                 // Back on the UI thread. The tree may have been replaced by a rescan while the shell was working.
                 if (gone && IsLive(session, store))
@@ -2639,10 +2648,41 @@ public partial class MainWindow : Window
         }
     }
 
+    // Shell moves and Recycle Bin deletes run on their own threads; ending the process under one would leave items half moved
+    private int _shellOperationsRunning;
+
+    /// <summary>True when the app may exit: no shell move or delete is running, or the user chose to exit anyway.</summary>
+    private bool ConfirmExitDuringShellOperation()
+    {
+        if (_shellOperationsRunning == 0)
+            return true;
+
+        // A window hidden in the tray cannot show the question
+        if (!IsVisible)
+            ShowAndActivateWindow();
+
+        AppLog.Warn("Exit requested while a move or delete is still running");
+        MessageBoxResult answer = System.Windows.MessageBox.Show(
+            this,
+            "A move or delete is still running. Exiting now would stop it part-way and leave some items moved or deleted and others not.\n\n" +
+            "Wait for it to finish, then exit. Exit anyway?",
+            "SpaceView",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Warning,
+            MessageBoxResult.No);
+        return answer == MessageBoxResult.Yes;
+    }
+
     private void Window_Closing(object? sender, CancelEventArgs e)
     {
         if (!_isExiting)
         {
+            if (!ConfirmExitDuringShellOperation())
+            {
+                e.Cancel = true;
+                return;
+            }
+
             _isExiting = true;
             CleanupResources();
             System.Windows.Application.Current.Shutdown();
@@ -2651,6 +2691,9 @@ public partial class MainWindow : Window
 
     private void ExitApplication()
     {
+        if (!_isExiting && !ConfirmExitDuringShellOperation())
+            return;
+
         _isExiting = true;
         CleanupResources();
         System.Windows.Application.Current.Shutdown();

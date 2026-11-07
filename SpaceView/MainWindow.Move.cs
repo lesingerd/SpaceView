@@ -322,7 +322,16 @@ public partial class MainWindow
                 : $"Moving {sources.Count:N0} items to {destination}...";
 
             IntPtr owner = new WindowInteropHelper(this).Handle;
-            ShellMoveResult result = await ShellMover.MoveAsync(sources, destination, owner);
+            ShellMoveResult result;
+            _shellOperationsRunning++;
+            try
+            {
+                result = await ShellMover.MoveAsync(sources, destination, owner);
+            }
+            finally
+            {
+                _shellOperationsRunning--;
+            }
 
             await ApplyMoveResultAsync(result, sources, destination, fromCut, fromForeignClipboard);
 

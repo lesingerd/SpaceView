@@ -156,6 +156,9 @@ public sealed class FileSystemStore
     public int PendingFreeCount { get { lock (_syncLock) return _pendingFree.Count; } }
     public int ReusableCount { get { lock (_syncLock) return _reusable.Count; } }
 
+    /// <summary>The number of hard-linked files being tracked (for diagnostics and tests).</summary>
+    public int LinkGroupCount { get { lock (_syncLock) return _linkGroups.Count; } }
+
     /// <summary>
     /// True once the name storage has grown to the warn limit (about 1.8 GB of names). The tree is still correct, but the
     /// drive should be rescanned, which builds a compact store; past the hard limit new names are stored empty
@@ -1066,8 +1069,9 @@ public sealed class FileSystemStore
     /// <summary>
     /// Makes ids reusable. The caller guarantees nothing it owns refers to them. Here the store's own references are
     /// dropped: the FRN map slot of the node (so a lookup can never land on the id's next owner), and the id in the
-    /// activity set. A file that is one name of a hard-linked file keeps its id out of circulation for good, because
-    /// link groups and the carrier hand-over keep ids of deleted names.
+    /// activity set. A name of a hard-linked file also leaves its link group (the group is dropped when fewer than two
+    /// live names remain), and if it was the file's size carrier while other names live on, the size is handed to one
+    /// of them first, so the id can be reused like any other.
     /// </summary>
     public void CommitReclaim(IEnumerable<int> ids)
     {
@@ -1082,8 +1086,8 @@ public sealed class FileSystemStore
                 if (!rec.IsDeleted)
                     continue; // already reused or never deleted: nothing to do
 
-                if (!rec.IsDirectory && rec.FileId != 0 && _linkGroups.ContainsKey(rec.FileId))
-                    continue;
+                if (!rec.IsDirectory && rec.FileId != 0 && _linkGroups.TryGetValue(rec.FileId, out List<int>? linkGroup))
+                    ForgetLinkNameUnsafe(id, rec.FileId, rec.Size, linkGroup);
 
                 UnmapFileIdInternal(rec.FileId, id);
                 _activity.Remove(id);
@@ -1091,6 +1095,45 @@ public sealed class FileSystemStore
                 _reusable.Add(id);
             }
         }
+    }
+
+    /// <summary>
+    /// A deleted name of a hard-linked file is about to lose its id (see <see cref="CommitReclaim"/>): takes it out of the
+    /// file's link group, hands the file's size and FRN map slot to a live name if this one was the carrier (a carrier
+    /// tombstoned inside a deleted subtree is not handed over at the time), and drops the group once it has fewer than
+    /// two live names.
+    /// </summary>
+    private void ForgetLinkNameUnsafe(int nodeId, ulong fileId, long size, List<int> group)
+    {
+        bool wasCarrier = TryGetMappedNodeUnsafe(fileId, out int carrierId) && carrierId == nodeId;
+        group.RemoveAll(m => m == nodeId);
+
+        int heirId = -1;
+        int live = 0;
+        foreach (int member in group)
+        {
+            ref NodeRecord candidate = ref GetNodeRef(member);
+            if (!candidate.IsDeleted && candidate.FileId == fileId)
+            {
+                live++;
+                if (heirId < 0)
+                    heirId = member;
+            }
+        }
+
+        if (wasCarrier && heirId >= 0)
+        {
+            GetNodeRef(heirId).Size = size;
+            MapFileIdInternal(fileId, heirId);
+            if (size != 0)
+            {
+                PropagateDeltaUnsafe(GetNodeRef(heirId).ParentId, size, 0, 0);
+                NoteActivityUnsafe(heirId); // its size changed: the UI refreshes it and its ancestors
+            }
+        }
+
+        if (live < 2)
+            _linkGroups.Remove(fileId);
     }
 
     // =========================================================================

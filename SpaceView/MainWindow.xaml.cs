@@ -1543,8 +1543,11 @@ public partial class MainWindow : Window
     /// </summary>
     private void ReclaimNodeIds(DriveSession session, FileSystemStore store, int start, int end)
     {
+        // A drive whose last (re)scan failed, or that waits for its next one, still has a live store and monitor, and
+        // its deleted ids pile up unless they are reclaimed: only a running scan holds that back
+        bool storeLive = ReferenceEquals(session.Store, store) && session.Monitor != null && session.State != DriveSessionState.Scanning;
         if (store.PendingFreeCount < ReclaimBatchMin ||
-            _fileOperationInProgress || _branchCts != null || _branchLoopRunning || _rowMenuOpen || session.State != DriveSessionState.Ready || !IsMainWindowEnabled())
+            _fileOperationInProgress || _branchCts != null || _branchLoopRunning || _rowMenuOpen || !storeLive || !IsMainWindowEnabled())
         {
             return;
         }
@@ -1587,6 +1590,29 @@ public partial class MainWindow : Window
         _syncSession = null;
         _syncStore = null;
         RowSync.ReleaseRows();
+        TrimReclaimScratch();
+    }
+
+    // The reclaim collections only hold one pass of data; a huge delete must not leave their capacity behind for weeks
+    private const int RetainedCollectionLimit = 64 * 1024;
+
+    private void TrimReclaimScratch()
+    {
+        if (_reclaimIds.Capacity > RetainedCollectionLimit)
+        {
+            _reclaimIds.Clear();
+            _reclaimIds.TrimExcess();
+        }
+        if (_reclaimSet.EnsureCapacity(0) > RetainedCollectionLimit)
+        {
+            _reclaimSet.Clear();
+            _reclaimSet.TrimExcess();
+        }
+        if (_reclaimReferenced.EnsureCapacity(0) > RetainedCollectionLimit)
+        {
+            _reclaimReferenced.Clear();
+            _reclaimReferenced.TrimExcess();
+        }
     }
 
     /// <summary>Refreshes every row of the drive (and brings its rows in line with the store): used after the store was changed outside the live updates.</summary>

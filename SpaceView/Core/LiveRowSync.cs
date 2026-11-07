@@ -136,6 +136,63 @@ public sealed class LiveRowSync<TRow> where TRow : class, ILiveRow
     {
         _displayed.Clear();
         Array.Clear(_refreshRows);
+        ShrinkScratch();
+    }
+
+    // One pass over a huge change (a drive-wide cleanup) must not leave its high-water collections behind for good
+    private const int RetainLimit = 64 * 1024;
+
+    /// <summary>Gives back scratch collections that grew past <see cref="RetainLimit"/> entries (they only hold per-pass data and are cleared at the start of the next pass).</summary>
+    private void ShrinkScratch()
+    {
+        Shrink(_changedIds);
+        Shrink(_changedPos);
+        Shrink(_changedSet);
+        Shrink(_wanted);
+        Shrink(_rowPos);
+        Shrink(_removedIds);
+        Shrink(_removeStarts);
+        Shrink(_removals);
+        Shrink(_touched);
+        Shrink(_touchedList);
+        Shrink(_cands);
+        Shrink(_ins);
+        Shrink(_edits);
+        Shrink(_childPos);
+        Shrink(_shownIds);
+        Shrink(_children);
+        Shrink(_affected);
+        if (_changedVals.Length > RetainLimit) _changedVals = Array.Empty<NodeRowValues>();
+        if (_refreshIds.Length > RetainLimit) _refreshIds = Array.Empty<int>();
+        if (_refreshRows.Length > RetainLimit) _refreshRows = Array.Empty<TRow>();
+        if (_refreshVals.Length > RetainLimit) _refreshVals = Array.Empty<NodeRowValues>();
+    }
+
+    private static void Shrink<T>(List<T> list)
+    {
+        if (list.Capacity > RetainLimit)
+        {
+            list.Clear();
+            list.TrimExcess();
+        }
+    }
+
+    private static void Shrink<T>(HashSet<T> set)
+    {
+        if (set.EnsureCapacity(0) > RetainLimit)
+        {
+            set.Clear();
+            set.TrimExcess();
+        }
+    }
+
+    private static void Shrink<TKey, TValue>(Dictionary<TKey, TValue> map) where TKey : notnull
+    {
+        if (map.EnsureCapacity(0) > RetainLimit)
+        {
+            map.Clear();
+            map.TrimExcess();
+        }
     }
 
     /// <summary>Largest first; equal sizes by node id (the order of <see cref="FileSystemStore.GetChildPage"/>).</summary>

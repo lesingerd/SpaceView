@@ -56,6 +56,13 @@ internal sealed class UsnBatch
         LastItemName = string.Empty;
         EstimatedBytes = 0;
     }
+
+    /// <summary>Gives back the capacity a large batch left behind (call after <see cref="Clear"/>).</summary>
+    public void TrimExcess()
+    {
+        Items.TrimExcess();
+        Order.TrimExcess();
+    }
 }
 
 internal enum UsnChunkResult

@@ -714,9 +714,13 @@ public partial class MainWindow : Window
         else
             pendingText = ComposeStatus($"  •  applying {backlog.Batch.Items.Count:N0} changes made during the scan...");
 
+        // Only this flag is captured: the monitor keeps the callback alive, and the backlog (every change collected
+        // during the scan) must not stay reachable through it
+        bool reportApplied = backlog != null && backlog.FailureReason == null;
+
         StartMonitor(session, result, applied =>
         {
-            if (backlog == null || backlog.FailureReason != null)
+            if (!reportApplied)
                 return;
 
             Dispatcher.BeginInvoke(() =>
@@ -1262,6 +1266,18 @@ public partial class MainWindow : Window
             if (e.Kind == UsnMonitorStatusKind.FellBackToWatcher)
             {
                 StatusTextBlock.Text = $"{session.RootPath}: {e.Message}; using limited FileSystemWatcher monitoring instead.";
+            }
+            else if (e.Kind == UsnMonitorStatusKind.Recovered)
+            {
+                session.MonitorProblem = null;
+                StatusTextBlock.Text = $"{session.RootPath}: live monitoring recovered.";
+            }
+            else if (e.Kind == UsnMonitorStatusKind.VolumeUnavailable)
+            {
+                // The monitor found the volume gone: the same state as when the drive list no longer shows it
+                AppLog.Warn($"Drive {session.RootPath} is no longer available (reported by its monitor)");
+                session.MarkUnavailable();
+                StatusTextBlock.Text = $"Drive {session.RootPath} is no longer available. Showing the results of the last scan; live monitoring stopped.";
             }
             else
             {

@@ -52,6 +52,7 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
     private FileSystemWatcher? _fallbackWatcher;
     private long _totalEventsProcessed;
     private int _rescanSignalled;
+    private int _nameStorageSignalled;
     private string? _lastFaultMessage;
     private bool _faultReportedThisPoll;
     private bool _disposed;
@@ -265,6 +266,7 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
     private int ApplyAndReport(SafeFileHandle hVolume, UsnBatch batch, CancellationToken ct)
     {
         int appliedCount = ApplyBatch(hVolume, batch, ct);
+        CheckNameStorage();
         int[] changedNodes = _store.TakeActivity();
 
         if (appliedCount > 0)
@@ -457,6 +459,17 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         ReportFault($"Reading the USN journal failed (Win32 error {readError}); will keep retrying");
     }
 
+    /// <summary>The store's name storage is nearly full (see <see cref="FileSystemStore.NameStorageNearlyFull"/>): ask for a rescan, once.</summary>
+    internal void CheckNameStorage()
+    {
+        if (!_store.NameStorageNearlyFull || Interlocked.Exchange(ref _nameStorageSignalled, 1) == 1)
+            return;
+
+        const string reason = "name storage is nearly full; rescan to compact";
+        AppLog.Warn($"{_store.RootPath}: {reason} ({_store.NameSlabCount:N0} slabs, {_store.LiveNodeCount:N0} live nodes)");
+        RescanRequired?.Invoke(this, reason);
+    }
+
     private void RaiseRescanRequired(string reason)
     {
         // Once per episode: stays latched until a journal read succeeds again
@@ -578,6 +591,7 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         try
         {
             int applied = HandleFallbackEvent(fullPath, isDelete, expandNewDirectory: true, isRename);
+            CheckNameStorage();
             int[] changedNodes = _store.TakeActivity();
             if (applied > 0)
             {

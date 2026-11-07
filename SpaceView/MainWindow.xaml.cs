@@ -2522,6 +2522,7 @@ public partial class MainWindow : Window
 
             AppLog.Info($"Store {session.RootPath}: live nodes {store.LiveNodeCount:N0} of {store.TotalNodeCount:N0} ids, " +
                         $"pending free {store.PendingFreeCount:N0}, reusable {store.ReusableCount:N0}, " +
+                        $"name slabs {store.NameSlabCount:N0} ({SizeFormatter.FormatBytes(store.NameSlabBytes)}, {store.FreeNameCount:N0} free slots), " +
                         $"~{SizeFormatter.FormatBytes(store.EstimatedMemoryBytes)} in memory, " +
                         $"events {session.Monitor?.TotalEventsProcessed ?? 0:N0}");
         }

@@ -122,6 +122,83 @@
                 </ItemsControl.ItemTemplate>
             </ItemsControl>
 
+            <!-- Memory section (hidden when the system call fails) -->
+            <StackPanel x:Name="MemorySection" Visibility="Collapsed">
+                <Border Height="1" Background="#1E293B" Margin="0,1,0,8"/>
+                <TextBlock Text="Memory"
+                           Foreground="#F8FAFC"
+                           FontWeight="SemiBold"
+                           FontSize="12"
+                           Margin="0,0,0,6"/>
+                <Border Background="#1E293B"
+                        CornerRadius="7"
+                        Padding="10,8"
+                        Margin="0,0,0,7">
+                    <StackPanel>
+                        <Grid Margin="0,0,0,5">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="{Binding HeaderText}"
+                                       Foreground="#F1F5F9"
+                                       FontWeight="SemiBold"
+                                       FontSize="12"
+                                       TextTrimming="CharacterEllipsis"/>
+                            <TextBlock Grid.Column="1"
+                                       Text="{Binding AvailableSummary}"
+                                       Foreground="#38BDF8"
+                                       FontWeight="SemiBold"
+                                       FontSize="11.5"
+                                       Margin="8,0,0,0"/>
+                        </Grid>
+
+                        <!-- Muted underlay = in use + cached, solid overlay = in use, track = free -->
+                        <Grid Height="8">
+                            <ProgressBar Minimum="0" Maximum="100"
+                                         Value="{Binding InUseAndCachedPercentage, Mode=OneWay}"
+                                         Background="#0F172A"
+                                         Foreground="{Binding CachedBrush}"
+                                         BorderThickness="0"
+                                         Template="{StaticResource PageFileBarTemplate}"/>
+                            <ProgressBar Minimum="0" Maximum="100"
+                                         Value="{Binding InUsePercentage, Mode=OneWay}"
+                                         Background="Transparent"
+                                         Foreground="{Binding UsedBrush}"
+                                         BorderThickness="0"
+                                         Template="{StaticResource PageFileBarTemplate}"/>
+                        </Grid>
+
+                        <TextBlock Text="{Binding DetailText}"
+                                   Foreground="#94A3B8"
+                                   FontSize="10.5"
+                                   Margin="0,4,0,0"/>
+
+                        <!-- Commit charge: light underlay = peak, solid = current -->
+                        <Grid Height="6" Margin="0,6,0,0">
+                            <ProgressBar Minimum="0" Maximum="100"
+                                         Value="{Binding CommitPeakPercentage, Mode=OneWay}"
+                                         Background="#0F172A"
+                                         Foreground="#7DD3FC"
+                                         BorderThickness="0"
+                                         Template="{StaticResource PageFileBarTemplate}"/>
+                            <ProgressBar Minimum="0" Maximum="100"
+                                         Value="{Binding CommitPercentage, Mode=OneWay}"
+                                         Background="Transparent"
+                                         Foreground="{Binding CommitBrush}"
+                                         BorderThickness="0"
+                                         Template="{StaticResource PageFileBarTemplate}"/>
+                        </Grid>
+
+                        <TextBlock Text="{Binding CommitText}"
+                                   Foreground="#94A3B8"
+                                   FontSize="10.5"
+                                   TextWrapping="Wrap"
+                                   Margin="0,4,0,0"/>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+
             <!-- Page file section (hidden when there is no page file or WMI has not answered) -->
             <StackPanel x:Name="PageFileSection" Visibility="Collapsed">
                 <Border Height="1" Background="#1E293B" Margin="0,1,0,8"/>

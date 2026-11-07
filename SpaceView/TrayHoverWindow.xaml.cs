@@ -1,5 +1,6 @@
 using System.Windows;
 using System.Windows.Media;
+using System.Windows.Threading;
 using SpaceView.Models;
 using SpaceView.Native;
 
@@ -10,6 +11,33 @@ public partial class TrayHoverWindow : Window
     public TrayHoverWindow()
     {
         InitializeComponent();
+
+        _memoryTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromSeconds(1) };
+        _memoryTimer.Tick += (_, _) => ShowMemory();
+        // Nothing runs while the popup is closed
+        IsVisibleChanged += (_, e) =>
+        {
+            if ((bool)e.NewValue)
+                _memoryTimer.Start();
+            else
+                _memoryTimer.Stop();
+        };
+    }
+
+    private readonly DispatcherTimer _memoryTimer;
+
+    /// <summary>Reads the memory figures (a call of microseconds) and rebinds the section; hides it when the read fails.</summary>
+    private void ShowMemory()
+    {
+        MemoryStatusViewModel? status = MemoryStatusViewModel.TryRead();
+        if (status == null)
+        {
+            MemorySection.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        MemorySection.DataContext = status;
+        MemorySection.Visibility = Visibility.Visible;
     }
 
     /// <summary>
@@ -20,6 +48,7 @@ public partial class TrayHoverWindow : Window
     {
         DrivesItemsControl.ItemsSource = DriveItemViewModel.LastResult.Drives;
         ShowPageFiles(PageFileViewModel.LastResult);
+        ShowMemory();
         PositionNearCursor();
         _ = RefreshDrivesAsync();
     }

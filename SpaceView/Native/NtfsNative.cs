@@ -267,6 +267,30 @@ public static unsafe class NtfsNative
     public const int THREAD_MODE_BACKGROUND_BEGIN = 0x00010000;
     public const int THREAD_MODE_BACKGROUND_END = 0x00020000;
 
+    /// <summary>PERFORMANCE_INFORMATION (psapi.h); counts are in pages of PageSize bytes.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PERFORMANCE_INFORMATION
+    {
+        public uint cb;
+        public UIntPtr CommitTotal;
+        public UIntPtr CommitLimit;
+        public UIntPtr CommitPeak;
+        public UIntPtr PhysicalTotal;
+        public UIntPtr PhysicalAvailable;
+        public UIntPtr SystemCache;
+        public UIntPtr KernelTotal;
+        public UIntPtr KernelPaged;
+        public UIntPtr KernelNonpaged;
+        public UIntPtr PageSize;
+        public uint HandleCount;
+        public uint ProcessCount;
+        public uint ThreadCount;
+    }
+
+    [DllImport("kernel32.dll", EntryPoint = "K32GetPerformanceInfo", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetPerformanceInfo(out PERFORMANCE_INFORMATION pPerformanceInformation, uint cb);
+
     [DllImport("kernel32.dll")]
     public static extern IntPtr GetCurrentThread();
 

@@ -160,6 +160,7 @@ public partial class MainWindow : Window
     private readonly BulkObservableCollection<TreeRowViewModel> _visibleRows = new();
     private readonly TrayIconManager _trayManager;
     private readonly DispatcherTimer _memoryTimer;
+    private readonly DispatcherTimer _statsLogTimer;
 
     // One tree, one root row per scanned drive; the first session is the most recently chosen drive. Every row resolves
     // its own session, and NodeIds are only unique per store, so rows are compared together with their session (RowKey).
@@ -208,7 +209,7 @@ public partial class MainWindow : Window
 
         LoadShieldIcon();
 
-        _ = StartupAsync();
+        _ = ObserveAsync(StartupAsync(), "Startup");
 
         _memoryTimer = new DispatcherTimer
         {
@@ -217,6 +218,13 @@ public partial class MainWindow : Window
         _memoryTimer.Tick += (_, _) => UpdateMemoryUsageDisplay();
         _memoryTimer.Start();
         UpdateMemoryUsageDisplay();
+
+        // Long runs: a line per drive about the store's reuse bookkeeping, once an hour (never per event)
+        _statsLogTimer = new DispatcherTimer { Interval = TimeSpan.FromHours(1) };
+        _statsLogTimer.Tick += (_, _) => LogStoreStats();
+        _statsLogTimer.Start();
+
+        StartDriveRefreshTimers();
 
         Loaded += (_, _) =>
         {
@@ -295,7 +303,90 @@ public partial class MainWindow : Window
             StatusTextBlock.Text = $"Not available, skipped: {string.Join(", ", missing)}";
     }
 
+    // Free space and total size change, drives come and go, and a machine that runs for weeks sleeps and wakes: the drive
+    // list is refreshed every minute and shortly after Windows reports a device arriving or leaving.
+    private static readonly TimeSpan DriveRefreshInterval = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan DeviceChangeDebounce = TimeSpan.FromSeconds(2);
+    // A drive must be missing from two refreshes in a row before it counts as gone (a resume from sleep can hide drives
+    // for a moment); a missing drive makes the next refresh come early, so a real removal is not noticed a minute late
+    private static readonly TimeSpan DriveMissConfirmDelay = TimeSpan.FromSeconds(5);
+    private DispatcherTimer? _driveRefreshTimer;
+    private DispatcherTimer? _deviceChangeTimer;
+    private bool _driveRefreshRunning;
+    private bool _driveRefreshQueued;
+    private readonly Dictionary<DriveSession, int> _driveMisses = new();
+
+    private void StartDriveRefreshTimers()
+    {
+        _driveRefreshTimer = new DispatcherTimer { Interval = DriveRefreshInterval };
+        _driveRefreshTimer.Tick += (_, _) =>
+        {
+            // Replacing the list while the dropdown is open would pull it out from under the user; the next tick catches up
+            if (DriveComboBox.IsDropDownOpen || _driveRefreshRunning || _isExiting)
+                return;
+            _ = ObserveAsync(RefreshDriveListAsync(preserveSelection: true), "Drive refresh");
+        };
+        _driveRefreshTimer.Start();
+
+        _deviceChangeTimer = new DispatcherTimer { Interval = DeviceChangeDebounce };
+        _deviceChangeTimer.Tick += (_, _) =>
+        {
+            _deviceChangeTimer.Stop();
+            if (_isExiting)
+                return;
+            if (DriveComboBox.IsDropDownOpen)
+            {
+                _deviceChangeTimer.Start(); // try again once the dropdown is closed
+                return;
+            }
+            _ = ObserveAsync(RefreshDriveListAsync(preserveSelection: true), "Drive refresh");
+        };
+    }
+
+    /// <summary>Windows reported a device arriving or leaving: refresh the drive list once the burst of messages is over.</summary>
+    private void OnDeviceChanged()
+    {
+        if (_deviceChangeTimer == null || _isExiting)
+            return;
+        _deviceChangeTimer.Interval = DeviceChangeDebounce;
+        _deviceChangeTimer.Stop();
+        _deviceChangeTimer.Start();
+    }
+
+    /// <summary>Refreshes the drive list; one refresh runs at a time, and a request that arrives meanwhile runs once more afterwards.</summary>
     private async Task RefreshDriveListAsync(bool preserveSelection)
+    {
+        if (_driveRefreshRunning)
+        {
+            _driveRefreshQueued = true;
+            return;
+        }
+
+        _driveRefreshRunning = true;
+        try
+        {
+            bool confirmMiss = await RefreshDriveListCoreAsync(preserveSelection);
+            while (_driveRefreshQueued)
+            {
+                _driveRefreshQueued = false;
+                confirmMiss = await RefreshDriveListCoreAsync(preserveSelection) || confirmMiss;
+            }
+
+            if (confirmMiss && _deviceChangeTimer != null && !_isExiting)
+            {
+                _deviceChangeTimer.Stop();
+                _deviceChangeTimer.Interval = DriveMissConfirmDelay;
+                _deviceChangeTimer.Start();
+            }
+        }
+        finally
+        {
+            _driveRefreshRunning = false;
+        }
+    }
+
+    /// <summary>Returns true when a drive was missing for the first time, so the caller should look again soon.</summary>
+    private async Task<bool> RefreshDriveListCoreAsync(bool preserveSelection)
     {
         DriveEnumeration result;
         try
@@ -304,7 +395,7 @@ public partial class MainWindow : Window
         }
         catch
         {
-            return;
+            return false;
         }
 
         // Read the selection only now: the user may have picked another drive while the drives were being queried
@@ -334,20 +425,43 @@ public partial class MainWindow : Window
         // Drives in the tree that are no longer in the list: keep showing them, but say so and stop watching a volume
         // that is gone. Drives that merely answered too slowly stay in the list. A drive that is being scanned is left alone.
         var gone = new List<string>();
+        bool firstMiss = false;
         foreach (DriveSession session in _sessions)
         {
             DriveItemViewModel? drive = result.Drives.FirstOrDefault(d => DriveSession.SameRoot(d.Name, session.RootPath));
             if (drive != null)
             {
+                _driveMisses.Remove(session);
                 ApplyVolumeInfo(session, drive);
+                if (session.IsUnavailable)
+                    AppLog.Info($"Drive {session.RootPath} is available again (marked stale)");
                 session.MarkAvailableAgain();
             }
             else if (!session.IsBusy && !session.IsUnavailable)
             {
-                session.MarkUnavailable();
-                gone.Add(session.RootPath);
+                int misses = _driveMisses.GetValueOrDefault(session) + 1;
+                _driveMisses[session] = misses;
+                if (misses >= 2)
+                {
+                    _driveMisses.Remove(session);
+                    AppLog.Warn($"Drive {session.RootPath} is no longer available; live monitoring stopped");
+                    session.MarkUnavailable();
+                    gone.Add(session.RootPath);
+                }
+                else
+                {
+                    AppLog.Info($"Drive {session.RootPath} was missing from the drive list (first time); checking again shortly");
+                    firstMiss = true;
+                }
             }
             RefreshRootRow(session);
+        }
+
+        // Sessions that were removed from the view must not stay in the miss counts
+        if (_driveMisses.Count > 0)
+        {
+            foreach (DriveSession stale in _driveMisses.Keys.Where(s => !_sessions.Contains(s)).ToList())
+                _driveMisses.Remove(stale);
         }
 
         if (gone.Count > 0)
@@ -361,6 +475,7 @@ public partial class MainWindow : Window
 
         UpdateMonitorBadge();
         UpdateElevationUi();
+        return firstMiss;
     }
 
     private static void ApplyVolumeInfo(DriveSession session, DriveItemViewModel drive) =>
@@ -527,6 +642,42 @@ public partial class MainWindow : Window
     /// </summary>
     private async Task StartSessionScanAsync(DriveSession session, string? rescanReason = null)
     {
+        try
+        {
+            await ScanSessionAsync(session, rescanReason);
+        }
+        catch (Exception ex)
+        {
+            // Fire-and-forget callers cannot observe this: log it and show it
+            AppLog.Error($"Scan of {session.RootPath} failed unexpectedly", ex);
+            if (!session.IsDisposed)
+            {
+                session.Fail(ex.Message);
+                RefreshRootRow(session);
+                StatusTextBlock.Text = $"Error scanning {session.RootPath}: {ex.Message}";
+            }
+        }
+    }
+
+    /// <summary>Awaits a task started without an await and logs and shows its failure instead of dropping it.</summary>
+    private async Task ObserveAsync(Task task, string what)
+    {
+        try
+        {
+            await task;
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error($"{what} failed", ex);
+            StatusTextBlock.Text = $"{what} failed: {ex.Message} (see spaceview.log)";
+        }
+    }
+
+    private async Task ScanSessionAsync(DriveSession session, string? rescanReason)
+    {
         if (session.IsDisposed)
             return;
 
@@ -540,6 +691,7 @@ public partial class MainWindow : Window
         StatusTextBlock.Text = $"{session.RootPath} queued for scanning...";
 
         bool gateHeld = false;
+        Stopwatch? scanTimer = null;
         try
         {
             await _scanGate.WaitAsync(ct);
@@ -548,6 +700,8 @@ public partial class MainWindow : Window
                 return;
 
             session.MarkScanning();
+            scanTimer = Stopwatch.StartNew();
+            AppLog.Info($"Scan started: {session.RootPath}" + (rescanReason != null ? $" (rescan: {rescanReason})" : string.Empty));
             RefreshRootRow(session);
             StatusTextBlock.Text = rescanReason != null
                 ? $"{rescanReason}. Rescanning {session.RootPath}..."
@@ -565,6 +719,7 @@ public partial class MainWindow : Window
             if (!ready)
             {
                 // Scanning a volume that is gone would replace a good tree with an empty one
+                AppLog.Warn($"Scan of {session.RootPath} not started: the drive is not ready");
                 if (session.Store != null)
                 {
                     session.MarkUnavailable();
@@ -602,9 +757,12 @@ public partial class MainWindow : Window
         catch (OperationCanceledException)
         {
             // Scan superseded by another one, or its drive was removed from the view
+            if (scanTimer != null)
+                AppLog.Info($"Scan cancelled: {session.RootPath} after {scanTimer.Elapsed.TotalSeconds:0.0} s");
         }
         catch (Exception ex)
         {
+            AppLog.Error($"Scan failed: {session.RootPath} after {scanTimer?.Elapsed.TotalSeconds ?? 0:0.0} s", ex);
             if (session.IsCurrentScan(cts))
             {
                 session.Fail(ex.Message);
@@ -627,6 +785,11 @@ public partial class MainWindow : Window
         bool expandRoot = firstLoad
             ? _sessions.Count > 0 && ReferenceEquals(_sessions[0], session)
             : _rootRows.TryGetValue(session, out TreeRowViewModel? existing) && existing.IsExpanded;
+
+        AppLog.Info($"Scan finished: {session.RootPath} in {result.Duration.TotalSeconds:0.0} s, " +
+                    $"{result.Store.LiveNodeCount:N0} nodes, {result.InaccessibleDirectories:N0} inaccessible folders, " +
+                    $"ntfs={result.IsNtfs}, usnReady={result.UsnJournalReady}, journalBacklog={result.UsnBacklog?.Batch.Items.Count ?? 0:N0}" +
+                    (result.UsnBacklog?.FailureReason != null ? $" (drain lost changes: {result.UsnBacklog.FailureReason})" : string.Empty));
 
         session.DetachMonitor();
         session.ApplyScanResult(result);
@@ -657,9 +820,13 @@ public partial class MainWindow : Window
         else
             pendingText = ComposeStatus($"  •  applying {backlog.Batch.Items.Count:N0} changes made during the scan...");
 
+        // Only this flag is captured: the monitor keeps the callback alive, and the backlog (every change collected
+        // during the scan) must not stay reachable through it
+        bool reportApplied = backlog != null && backlog.FailureReason == null;
+
         StartMonitor(session, result, applied =>
         {
-            if (backlog == null || backlog.FailureReason != null)
+            if (!reportApplied)
                 return;
 
             Dispatcher.BeginInvoke(() =>
@@ -1157,7 +1324,7 @@ public partial class MainWindow : Window
                 ApplyLiveStoreUpdatesToVisibleRows(session, args);
         }
 
-        int delay = session.PassDelayMs(Environment.TickCount64);
+        int delay = session.PassDelayMs(Environment.TickCount64, Volatile.Read(ref _hiddenInTray) ? HiddenMinGapMs : PassPacer.MinGapMs);
         if (delay <= 0)
         {
             Dispatcher.BeginInvoke(DispatcherPriority.Background, Run);
@@ -1205,6 +1372,18 @@ public partial class MainWindow : Window
             if (e.Kind == UsnMonitorStatusKind.FellBackToWatcher)
             {
                 StatusTextBlock.Text = $"{session.RootPath}: {e.Message}; using limited FileSystemWatcher monitoring instead.";
+            }
+            else if (e.Kind == UsnMonitorStatusKind.Recovered)
+            {
+                session.MonitorProblem = null;
+                StatusTextBlock.Text = $"{session.RootPath}: live monitoring recovered.";
+            }
+            else if (e.Kind == UsnMonitorStatusKind.VolumeUnavailable)
+            {
+                // The monitor found the volume gone: the same state as when the drive list no longer shows it
+                AppLog.Warn($"Drive {session.RootPath} is no longer available (reported by its monitor)");
+                session.MarkUnavailable();
+                StatusTextBlock.Text = $"Drive {session.RootPath} is no longer available. Showing the results of the last scan; live monitoring stopped.";
             }
             else
             {
@@ -1346,7 +1525,7 @@ public partial class MainWindow : Window
     /// </summary>
     private void PulseActivityRows(FileSystemStore store, HashSet<int> activity)
     {
-        if (activity.Count == 0 || !SystemParameters.ClientAreaAnimation)
+        if (activity.Count == 0 || !IsVisible || !SystemParameters.ClientAreaAnimation)
             return;
 
         long now = Environment.TickCount64;
@@ -1364,8 +1543,11 @@ public partial class MainWindow : Window
     /// </summary>
     private void ReclaimNodeIds(DriveSession session, FileSystemStore store, int start, int end)
     {
+        // A drive whose last (re)scan failed, or that waits for its next one, still has a live store and monitor, and
+        // its deleted ids pile up unless they are reclaimed: only a running scan holds that back
+        bool storeLive = ReferenceEquals(session.Store, store) && session.Monitor != null && session.State != DriveSessionState.Scanning;
         if (store.PendingFreeCount < ReclaimBatchMin ||
-            _fileOperationInProgress || _branchCts != null || _branchLoopRunning || _rowMenuOpen || session.State != DriveSessionState.Ready || !IsMainWindowEnabled())
+            _fileOperationInProgress || _branchCts != null || _branchLoopRunning || _rowMenuOpen || !storeLive || !IsMainWindowEnabled())
         {
             return;
         }
@@ -1408,6 +1590,29 @@ public partial class MainWindow : Window
         _syncSession = null;
         _syncStore = null;
         RowSync.ReleaseRows();
+        TrimReclaimScratch();
+    }
+
+    // The reclaim collections only hold one pass of data; a huge delete must not leave their capacity behind for weeks
+    private const int RetainedCollectionLimit = 64 * 1024;
+
+    private void TrimReclaimScratch()
+    {
+        if (_reclaimIds.Capacity > RetainedCollectionLimit)
+        {
+            _reclaimIds.Clear();
+            _reclaimIds.TrimExcess();
+        }
+        if (_reclaimSet.EnsureCapacity(0) > RetainedCollectionLimit)
+        {
+            _reclaimSet.Clear();
+            _reclaimSet.TrimExcess();
+        }
+        if (_reclaimReferenced.EnsureCapacity(0) > RetainedCollectionLimit)
+        {
+            _reclaimReferenced.Clear();
+            _reclaimReferenced.TrimExcess();
+        }
     }
 
     /// <summary>Refreshes every row of the drive (and brings its rows in line with the store): used after the store was changed outside the live updates.</summary>
@@ -1939,7 +2144,16 @@ public partial class MainWindow : Window
                 StatusTextBlock.Text = rows.Count == 1
                     ? $"Moving {currentPath} to the Recycle Bin..."
                     : $"Moving {currentPath} to the Recycle Bin ({i + 1:N0} of {rows.Count:N0})...";
-                bool gone = await DeleteToRecycleBinAsync(currentPath, row.IsDirectory);
+                bool gone;
+                _shellOperationsRunning++;
+                try
+                {
+                    gone = await DeleteToRecycleBinAsync(currentPath, row.IsDirectory);
+                }
+                finally
+                {
+                    _shellOperationsRunning--;
+                }
 
                 // Back on the UI thread. The tree may have been replaced by a rescan while the shell was working.
                 if (gone && IsLive(session, store))
@@ -2398,14 +2612,24 @@ public partial class MainWindow : Window
         }
     }
 
+    // Hidden in the tray nobody sees the rows or the memory line: their timers and flashes rest, and live passes are
+    // spaced further apart (rows stay in step, they are just updated less often)
+    private const int HiddenMinGapMs = 2000;
+    private bool _hiddenInTray; // read from monitor threads too
+
     private void MinimizeToTray()
     {
+        Volatile.Write(ref _hiddenInTray, true);
+        _memoryTimer.Stop();
         Hide();
         ShowInTaskbar = false;
     }
 
     private void ShowAndActivateWindow()
     {
+        Volatile.Write(ref _hiddenInTray, false);
+        _memoryTimer.Start();
+        UpdateMemoryUsageDisplay();
         ShowInTaskbar = true;
         Show();
         WindowState = _lastNonMinimizedState == WindowState.Minimized ? WindowState.Normal : _lastNonMinimizedState;
@@ -2424,10 +2648,41 @@ public partial class MainWindow : Window
         }
     }
 
+    // Shell moves and Recycle Bin deletes run on their own threads; ending the process under one would leave items half moved
+    private int _shellOperationsRunning;
+
+    /// <summary>True when the app may exit: no shell move or delete is running, or the user chose to exit anyway.</summary>
+    private bool ConfirmExitDuringShellOperation()
+    {
+        if (_shellOperationsRunning == 0)
+            return true;
+
+        // A window hidden in the tray cannot show the question
+        if (!IsVisible)
+            ShowAndActivateWindow();
+
+        AppLog.Warn("Exit requested while a move or delete is still running");
+        MessageBoxResult answer = System.Windows.MessageBox.Show(
+            this,
+            "A move or delete is still running. Exiting now would stop it part-way and leave some items moved or deleted and others not.\n\n" +
+            "Wait for it to finish, then exit. Exit anyway?",
+            "SpaceView",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Warning,
+            MessageBoxResult.No);
+        return answer == MessageBoxResult.Yes;
+    }
+
     private void Window_Closing(object? sender, CancelEventArgs e)
     {
         if (!_isExiting)
         {
+            if (!ConfirmExitDuringShellOperation())
+            {
+                e.Cancel = true;
+                return;
+            }
+
             _isExiting = true;
             CleanupResources();
             System.Windows.Application.Current.Shutdown();
@@ -2436,6 +2691,9 @@ public partial class MainWindow : Window
 
     private void ExitApplication()
     {
+        if (!_isExiting && !ConfirmExitDuringShellOperation())
+            return;
+
         _isExiting = true;
         CleanupResources();
         System.Windows.Application.Current.Shutdown();
@@ -2445,6 +2703,9 @@ public partial class MainWindow : Window
     private void CleanupResources()
     {
         _memoryTimer.Stop();
+        _statsLogTimer.Stop();
+        _driveRefreshTimer?.Stop();
+        _deviceChangeTimer?.Stop();
         ReleaseClipboardNotifications();
         _branchCts?.Cancel();
         foreach (DriveSession session in _sessions)
@@ -2452,6 +2713,22 @@ public partial class MainWindow : Window
             session.Dispose();
         }
         _trayManager.Dispose();
+    }
+
+    private void LogStoreStats()
+    {
+        foreach (DriveSession session in _sessions)
+        {
+            FileSystemStore? store = session.Store;
+            if (store == null)
+                continue;
+
+            AppLog.Info($"Store {session.RootPath}: live nodes {store.LiveNodeCount:N0} of {store.TotalNodeCount:N0} ids, " +
+                        $"pending free {store.PendingFreeCount:N0}, reusable {store.ReusableCount:N0}, " +
+                        $"name slabs {store.NameSlabCount:N0} ({SizeFormatter.FormatBytes(store.NameSlabBytes)}, {store.FreeNameCount:N0} free slots), " +
+                        $"~{SizeFormatter.FormatBytes(store.EstimatedMemoryBytes)} in memory, " +
+                        $"events {session.Monitor?.TotalEventsProcessed ?? 0:N0}");
+        }
     }
 
     private void UpdateMemoryUsageDisplay()

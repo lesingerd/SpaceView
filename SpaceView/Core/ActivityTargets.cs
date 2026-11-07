@@ -52,46 +52,72 @@ public static class ActivityTargets
         if (nodeIds.Count == 0 || displayedCount == 0)
             return rows;
 
-        store.ReadParents(parentOf =>
+        // The working collections are kept per thread and reused (a pass runs about once a second for weeks); they are
+        // emptied afterwards, so no row stays reachable through them
+        Dictionary<int, TRow?> resolved = Scratch<TRow>.Resolved ??= new Dictionary<int, TRow?>();
+        List<int> chain = Scratch<TRow>.Chain ??= new List<int>();
+        HashSet<TRow> seenRows = Scratch<TRow>.SeenRows ??= new HashSet<TRow>(ReferenceEqualityComparer.Instance);
+        resolved.Clear();
+        chain.Clear();
+        seenRows.Clear();
+
+        try
         {
-            // node -> its target row (null: none). Shared ancestors are walked only once per batch.
-            var resolved = new Dictionary<int, TRow?>();
-            var chain = new List<int>();
-            var seenRows = new HashSet<TRow>(ReferenceEqualityComparer.Instance);
-            int distinct = 0;
-
-            foreach (int start in nodeIds)
+            store.ReadParents(parentOf =>
             {
-                if (resolved.ContainsKey(start))
-                    continue;
-                if (++distinct > maxNodes)
-                    break;
+                // node -> its target row (null: none). Shared ancestors are walked only once per batch.
+                int distinct = 0;
 
-                chain.Clear();
-                TRow? target = null;
-                int id = start;
-                // The depth of a tree is far below this; the bound only guards against a corrupt parent link
-                for (int steps = 0; id >= 0 && steps < 4096; steps++)
+                foreach (int start in nodeIds)
                 {
-                    if (resolved.TryGetValue(id, out target))
+                    if (resolved.ContainsKey(start))
+                        continue;
+                    if (++distinct > maxNodes)
                         break;
 
-                    chain.Add(id);
-                    if (tryGetRow(id, out target))
-                        break;
+                    chain.Clear();
+                    TRow? target = null;
+                    int id = start;
+                    // The depth of a tree is far below this; the bound only guards against a corrupt parent link
+                    for (int steps = 0; id >= 0 && steps < 4096; steps++)
+                    {
+                        if (resolved.TryGetValue(id, out target))
+                            break;
 
-                    id = parentOf(id);
+                        chain.Add(id);
+                        if (tryGetRow(id, out target))
+                            break;
+
+                        id = parentOf(id);
+                    }
+
+                    // Every node on the walked chain below the found row resolves to the same row
+                    foreach (int visited in chain)
+                        resolved[visited] = target;
+
+                    if (target != null && seenRows.Add(target))
+                        rows.Add(target);
                 }
-
-                // Every node on the walked chain below the found row resolves to the same row
-                foreach (int visited in chain)
-                    resolved[visited] = target;
-
-                if (target != null && seenRows.Add(target))
-                    rows.Add(target);
-            }
-        });
+            });
+        }
+        finally
+        {
+            const int RetainLimit = 64 * 1024;
+            resolved.Clear();
+            chain.Clear();
+            seenRows.Clear();
+            if (resolved.EnsureCapacity(0) > RetainLimit) { resolved.TrimExcess(); }
+            if (chain.Capacity > RetainLimit) { chain.TrimExcess(); }
+            if (seenRows.EnsureCapacity(0) > RetainLimit) { seenRows.TrimExcess(); }
+        }
 
         return rows;
+    }
+
+    private static class Scratch<TRow> where TRow : class
+    {
+        [ThreadStatic] public static Dictionary<int, TRow?>? Resolved;
+        [ThreadStatic] public static List<int>? Chain;
+        [ThreadStatic] public static HashSet<TRow>? SeenRows;
     }
 }

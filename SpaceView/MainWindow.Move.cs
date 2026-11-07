@@ -34,10 +34,17 @@ public partial class MainWindow
         }
     }
 
+    // Sent to every top-level window when a device (a volume, a USB disk) arrives or is removed
+    private const int WmDeviceChange = 0x0219;
+    private const int DbtDeviceArrival = 0x8000;
+    private const int DbtDeviceRemoveComplete = 0x8004;
+
     private IntPtr WindowMessageHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
     {
         if (msg == ShellClipboard.WmClipboardUpdate)
             OnClipboardChanged();
+        else if (msg == WmDeviceChange && ((int)wParam == DbtDeviceArrival || (int)wParam == DbtDeviceRemoveComplete))
+            OnDeviceChanged();
         return IntPtr.Zero;
     }
 
@@ -315,7 +322,16 @@ public partial class MainWindow
                 : $"Moving {sources.Count:N0} items to {destination}...";
 
             IntPtr owner = new WindowInteropHelper(this).Handle;
-            ShellMoveResult result = await ShellMover.MoveAsync(sources, destination, owner);
+            ShellMoveResult result;
+            _shellOperationsRunning++;
+            try
+            {
+                result = await ShellMover.MoveAsync(sources, destination, owner);
+            }
+            finally
+            {
+                _shellOperationsRunning--;
+            }
 
             await ApplyMoveResultAsync(result, sources, destination, fromCut, fromForeignClipboard);
 

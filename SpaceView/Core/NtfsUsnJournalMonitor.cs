@@ -25,7 +25,11 @@ public enum UsnMonitorStatusKind
     /// <summary>The monitor could not use the USN journal and switched to the FileSystemWatcher fallback.</summary>
     FellBackToWatcher,
     /// <summary>Something went wrong; live data may be incomplete until a rescan.</summary>
-    Fault
+    Fault,
+    /// <summary>Reading the journal (or the watcher) works again after a fault that was not a lost position: the problem marker can go.</summary>
+    Recovered,
+    /// <summary>The volume is gone from the system (confirmed twice): the session should be marked unavailable.</summary>
+    VolumeUnavailable
 }
 
 public sealed class UsnMonitorStatusEventArgs : EventArgs
@@ -52,14 +56,37 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
     private FileSystemWatcher? _fallbackWatcher;
     private long _totalEventsProcessed;
     private int _rescanSignalled;
+    private int _nameStorageSignalled;
     private string? _lastFaultMessage;
-    private bool _faultReportedThisPoll;
-    private bool _disposed;
+    private volatile bool _disposed;
     private UsnJournalBacklog? _backlog;
 
     // Held while a journal batch is read and applied, so a pause request waits for an in-flight batch
     private readonly object _applyGate = new();
     private int _pauseCount;
+
+    // Recovery (touched on the monitor thread, under _applyGate, except where noted)
+    private int _consecutiveReadFailures;
+    private bool _readFaultActive;
+    private bool _stickyFaultReported; // a change could not be applied: live totals stay doubtful until a rescan
+    private int _goneStrikes;
+    private long _itemFaults;
+
+    // The watcher fallback: created, recreated and disposed under _watcherLock (never after Dispose)
+    private readonly object _watcherLock = new();
+    private int _watcherRestarting;
+
+    /// <summary>Polling interval of the USN loop and the pause after failed reads (the last one repeats). Settable for tests.</summary>
+    internal int[] BackoffMs { get; set; } = { 400, 1000, 5000, 30000 };
+
+    /// <summary>After this many failed reads in a row the volume handle is reopened.</summary>
+    internal int ReopenAfterFailures { get; set; } = 3;
+
+    /// <summary>Waits before the watcher is created again after an error (the last one repeats). Settable for tests.</summary>
+    internal TimeSpan[] WatcherRetryDelays { get; set; } = { TimeSpan.FromSeconds(30), TimeSpan.FromMinutes(5) };
+
+    /// <summary>The system calls the loop makes, replaceable by tests (a failing volume, a record source).</summary>
+    internal MonitorHooks Hooks { get; set; } = new();
 
     public bool IsUsnJournalActive => _usnActive;
     public long TotalEventsProcessed => Interlocked.Read(ref _totalEventsProcessed);
@@ -130,20 +157,26 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
     /// </summary>
     public IDisposable PauseApplyingChanges()
     {
+        // The count goes up first, so a batch that starts from now on sees the pause; taking and releasing the gate then
+        // waits for the batch that was already running
+        Interlocked.Increment(ref _pauseCount);
         lock (_applyGate)
         {
-            _pauseCount++;
         }
         return new PauseScope(this);
     }
 
+    /// <summary>Lock-free, so the UI thread never waits for a batch that is being applied.</summary>
     private void ResumeApplying()
     {
-        lock (_applyGate)
+        int current;
+        do
         {
-            if (_pauseCount > 0)
-                _pauseCount--;
+            current = Volatile.Read(ref _pauseCount);
+            if (current <= 0)
+                return;
         }
+        while (Interlocked.CompareExchange(ref _pauseCount, current - 1, current) != current);
     }
 
     private sealed class PauseScope : IDisposable
@@ -157,19 +190,11 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
 
     private async Task RunUsnJournalLoopAsync(CancellationToken ct)
     {
+        SafeFileHandle? hVolume = null;
+        IntPtr bufferPtr = IntPtr.Zero;
         try
         {
-            string volumeDevicePath = @"\\.\" + _store.RootPath.TrimEnd('\\');
-            using SafeFileHandle hVolume = NtfsNative.CreateFileW(
-                volumeDevicePath,
-                NtfsNative.GENERIC_READ,
-                NtfsNative.FILE_SHARE_ALL,
-                IntPtr.Zero,
-                NtfsNative.OPEN_EXISTING,
-                0,
-                IntPtr.Zero);
-
-            int openError = hVolume.IsInvalid ? Marshal.GetLastWin32Error() : 0;
+            hVolume = OpenVolume(out int openError);
 
             // What the drain collected during the scan goes in first; without a usable volume handle the nodes are
             // still found by path
@@ -183,38 +208,48 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
                 return;
             }
 
-            IntPtr bufferPtr = UsnJournalReader.AllocateAlignedBuffer();
-            try
+            bufferPtr = UsnJournalReader.AllocateAlignedBuffer();
+            var batch = new UsnBatch();
+            int delayMs = BackoffMs[0];
+
+            while (!ct.IsCancellationRequested)
             {
-                var batch = new UsnBatch();
+                await Task.Delay(delayMs, ct).ConfigureAwait(false);
 
-                while (!ct.IsCancellationRequested)
+                // One bad batch must not silently kill the monitor: report it and keep polling
+                try
                 {
-                    await Task.Delay(400, ct).ConfigureAwait(false);
-
-                    // One bad batch must not silently kill the monitor: report it and keep polling
-                    try
+                    lock (_applyGate)
                     {
-                        lock (_applyGate)
-                        {
-                            if (_pauseCount > 0)
-                                continue;
+                        if (Volatile.Read(ref _pauseCount) > 0)
+                            continue;
 
-                            _faultReportedThisPoll = false;
-                            PollAndApplyUsnBatch(hVolume, bufferPtr, batch, ct);
-                            if (!_faultReportedThisPoll)
-                                _lastFaultMessage = null;
+                        int readError = PollAndApplyUsnBatch(hVolume, bufferPtr, batch, ct, out bool positionLost);
+                        if (readError == 0)
+                        {
+                            OnReadsSucceeded(positionLost);
+                            delayMs = BackoffMs[0];
+                        }
+                        else
+                        {
+                            _consecutiveReadFailures++;
+                            _readFaultActive = true;
+                            ReportFault($"Reading the USN journal failed (Win32 error {readError}); will keep retrying");
+
+                            // A handle that stays broken (volume remounted, device reset) is replaced
+                            if (_consecutiveReadFailures >= ReopenAfterFailures && !TryReopenVolume(ref hVolume))
+                                return; // the volume is gone: the session was told
+                            delayMs = BackoffMs[Math.Min(_consecutiveReadFailures, BackoffMs.Length - 1)];
                         }
                     }
-                    catch (Exception ex) when (ex is not OperationCanceledException)
-                    {
-                        ReportFault($"USN monitor error: {ex.Message}");
-                    }
                 }
-            }
-            finally
-            {
-                UsnJournalReader.FreeAlignedBuffer(bufferPtr);
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _consecutiveReadFailures++;
+                    _readFaultActive = true;
+                    ReportFault($"USN monitor error: {ex.Message}");
+                    delayMs = BackoffMs[Math.Min(_consecutiveReadFailures, BackoffMs.Length - 1)];
+                }
             }
         }
         catch (OperationCanceledException)
@@ -223,24 +258,105 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         }
         catch (Exception ex)
         {
-            ReportFault($"USN monitor stopped: {ex.Message}");
+            // Never stop silently: the tree is no longer kept up to date by the journal, so watch the volume the
+            // limited way and mark the drive for a rescan
+            AppLog.Error($"{_store.RootPath}: USN monitor stopped", ex);
+            if (!_disposed)
+            {
+                SwitchToFallback($"The USN monitor stopped ({ex.Message})");
+                RaiseRescanRequired("The USN monitor stopped unexpectedly, changes may have been missed");
+            }
+        }
+        finally
+        {
+            UsnJournalReader.FreeAlignedBuffer(bufferPtr);
+            hVolume?.Dispose();
         }
     }
 
-    private void PollAndApplyUsnBatch(
+    private SafeFileHandle OpenVolume(out int error) =>
+        Hooks.OpenVolume(@"\\.\" + _store.RootPath.TrimEnd('\\'), out error);
+
+    /// <summary>A poll read fine (or lost its position and re-synced): the failure streak and the fault marker end.</summary>
+    private void OnReadsSucceeded(bool positionLost)
+    {
+        _consecutiveReadFailures = 0;
+        _goneStrikes = 0;
+        if (positionLost || !_readFaultActive)
+            return;
+
+        _readFaultActive = false;
+        _lastFaultMessage = null;
+        AppLog.Info($"{_store.RootPath}: reading the USN journal works again");
+        if (!_stickyFaultReported)
+            RaiseStatus(UsnMonitorStatusKind.Recovered, "Live monitoring recovered");
+    }
+
+    /// <summary>
+    /// Replaces the volume handle after repeated failed reads and checks the journal is still the one we follow: a different
+    /// journal id or a position that fell out of the journal asks for a rescan. Returns false when the volume is gone
+    /// (confirmed by two attempts in a row), after the session was told; true otherwise (the old handle is kept if
+    /// the volume cannot be opened yet).
+    /// </summary>
+    private bool TryReopenVolume(ref SafeFileHandle hVolume)
+    {
+        SafeFileHandle fresh = OpenVolume(out int error);
+        if (fresh.IsInvalid)
+        {
+            fresh.Dispose();
+            bool gone = error is 2 or 3 or 15 or 21 or 1167 && !Hooks.RootExists(_store.RootPath);
+            if (gone && ++_goneStrikes >= 2)
+            {
+                AppLog.Warn($"{_store.RootPath}: the volume no longer exists (Win32 error {error}); monitor stops");
+                RaiseStatus(UsnMonitorStatusKind.VolumeUnavailable, "The volume is no longer available");
+                return false;
+            }
+            if (!gone)
+                _goneStrikes = 0;
+            AppLog.Warn($"{_store.RootPath}: could not reopen the volume (Win32 error {error})");
+            return true;
+        }
+
+        _goneStrikes = 0;
+        SafeFileHandle old = hVolume;
+        hVolume = fresh;
+        old.Dispose();
+        AppLog.Info($"{_store.RootPath}: volume handle reopened after {_consecutiveReadFailures} failed reads");
+
+        if (Hooks.IsPositionLost(fresh, 0, ref _journalId, ref _nextUsn, out string lostMessage))
+            RaiseRescanRequired(lostMessage);
+        return true;
+    }
+
+    /// <summary>
+    /// Reads and applies what the journal has. Returns 0, or the Win32 error of a failed read that is not a lost position
+    /// (which raises RescanRequired instead and re-syncs, see <paramref name="positionLost"/>).
+    /// </summary>
+    private int PollAndApplyUsnBatch(
         SafeFileHandle hVolume,
         IntPtr bufferPtr,
         UsnBatch batch,
-        CancellationToken ct)
+        CancellationToken ct,
+        out bool positionLost)
     {
+        positionLost = false;
+        int failure = 0;
         batch.Clear();
 
         while (!ct.IsCancellationRequested)
         {
-            UsnChunkResult chunk = UsnJournalReader.ReadChunk(hVolume, bufferPtr, _journalId, ref _nextUsn, batch, out int readError);
+            UsnChunkResult chunk = Hooks.ReadChunk(hVolume, bufferPtr, _journalId, ref _nextUsn, batch, out int readError);
             if (chunk == UsnChunkResult.Failed)
             {
-                HandleJournalReadFailure(hVolume, readError);
+                if (Hooks.IsPositionLost(hVolume, readError, ref _journalId, ref _nextUsn, out string lostMessage))
+                {
+                    positionLost = true;
+                    RaiseRescanRequired(lostMessage);
+                }
+                else
+                {
+                    failure = readError == 0 ? -1 : readError;
+                }
                 break;
             }
 
@@ -255,16 +371,25 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
                 break;
         }
 
-        if (batch.Items.Count == 0)
-            return;
+        if (batch.Items.Count > 0)
+        {
+            ApplyAndReport(hVolume, batch, ct);
 
-        ApplyAndReport(hVolume, batch, ct);
+            // A burst must not leave a big dictionary behind for the rest of a weeks-long run
+            if (batch.Items.Count > 1024)
+            {
+                batch.Clear();
+                batch.TrimExcess();
+            }
+        }
+        return failure;
     }
 
     /// <summary>Applies a batch to the store and tells listeners what changed.</summary>
     private int ApplyAndReport(SafeFileHandle hVolume, UsnBatch batch, CancellationToken ct)
     {
         int appliedCount = ApplyBatch(hVolume, batch, ct);
+        CheckNameStorage();
         int[] changedNodes = _store.TakeActivity();
 
         if (appliedCount > 0)
@@ -296,7 +421,10 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
                 applied = ApplyAndReport(hVolume, backlog.Batch, ct);
         }
         backlog.Batch.Clear(); // the records are applied; free the memory
+        backlog.Batch.TrimExcess();
 
+        AppLog.Info($"{_store.RootPath}: journal backlog applied ({applied:N0} changes)" +
+                    (backlog.FailureReason != null ? $"; the drain had lost changes: {backlog.FailureReason}" : string.Empty));
         BacklogApplied?.Invoke(this, applied);
         if (backlog.FailureReason != null)
             RaiseRescanRequired(backlog.FailureReason);
@@ -417,7 +545,13 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         }
         catch (Exception ex)
         {
-            ReportFault($"Failed to apply change to '{item.Name}': {ex.Message}. Live totals may be out of date until the next rescan.");
+            // The item is only logged (a constant message keeps the status dedup working and the UI quiet); the log
+            // is thinned out too, since a systematic failure repeats for every record
+            long count = Interlocked.Increment(ref _itemFaults);
+            if (count <= 10 || count % 1000 == 0)
+                AppLog.Warn($"{_store.RootPath}: failed to apply a change to '{item.Name}' (failure #{count:N0}): {ex.Message}");
+            _stickyFaultReported = true;
+            ReportFault("Some changes could not be applied; live totals may be out of date until the next rescan");
             return UsnApplyResult.Ignored;
         }
     }
@@ -444,15 +578,15 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         }
     }
 
-    private void HandleJournalReadFailure(SafeFileHandle hVolume, int readError)
+    /// <summary>The store's name storage is nearly full (see <see cref="FileSystemStore.NameStorageNearlyFull"/>): ask for a rescan, once.</summary>
+    internal void CheckNameStorage()
     {
-        if (UsnJournalReader.IsPositionLost(hVolume, readError, ref _journalId, ref _nextUsn, out string lostMessage))
-        {
-            RaiseRescanRequired(lostMessage);
+        if (!_store.NameStorageNearlyFull || Interlocked.Exchange(ref _nameStorageSignalled, 1) == 1)
             return;
-        }
 
-        ReportFault($"Reading the USN journal failed (Win32 error {readError}); will keep retrying");
+        const string reason = "name storage is nearly full; rescan to compact";
+        AppLog.Warn($"{_store.RootPath}: {reason} ({_store.NameSlabCount:N0} slabs, {_store.LiveNodeCount:N0} live nodes)");
+        RescanRequired?.Invoke(this, reason);
     }
 
     private void RaiseRescanRequired(string reason)
@@ -461,19 +595,26 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         if (Interlocked.Exchange(ref _rescanSignalled, 1) == 1)
             return;
 
+        AppLog.Warn($"{_store.RootPath}: rescan required: {reason}");
         RescanRequired?.Invoke(this, reason);
     }
 
+    /// <summary>Reports a fault once: the same message again is dropped until the monitor recovers.</summary>
     private void ReportFault(string message)
     {
-        _faultReportedThisPoll = true;
-        if (string.Equals(_lastFaultMessage, message, StringComparison.Ordinal))
+        if (string.Equals(Volatile.Read(ref _lastFaultMessage), message, StringComparison.Ordinal))
             return;
 
         _lastFaultMessage = message;
+        AppLog.Warn($"{_store.RootPath}: monitor fault: {message}");
+        RaiseStatus(UsnMonitorStatusKind.Fault, message);
+    }
+
+    private void RaiseStatus(UsnMonitorStatusKind kind, string message)
+    {
         StatusChanged?.Invoke(this, new UsnMonitorStatusEventArgs
         {
-            Kind = UsnMonitorStatusKind.Fault,
+            Kind = kind,
             Message = message
         });
     }
@@ -481,12 +622,9 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
     private void SwitchToFallback(string reason)
     {
         _usnActive = false;
+        AppLog.Warn($"{_store.RootPath}: fell back to the file system watcher: {reason}");
         StartFallbackWatcher();
-        StatusChanged?.Invoke(this, new UsnMonitorStatusEventArgs
-        {
-            Kind = UsnMonitorStatusKind.FellBackToWatcher,
-            Message = reason
-        });
+        RaiseStatus(UsnMonitorStatusKind.FellBackToWatcher, reason);
     }
 
     /// <summary>Opens the node by file ID, or by path through its known parent; the handle is invalid if both fail.</summary>
@@ -530,41 +668,109 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
             NtfsNative.FILE_FLAG_BACKUP_SEMANTICS | NtfsNative.FILE_FLAG_OPEN_REPARSE_POINT);
     }
 
-    private void StartFallbackWatcher()
+    /// <summary>
+    /// Creates the fallback watcher unless the monitor was disposed (checked and assigned under the same lock that
+    /// <see cref="Dispose"/> takes, so a watcher can never outlive the monitor). Returns false when it could not be created.
+    /// </summary>
+    private bool StartFallbackWatcher()
+    {
+        lock (_watcherLock)
+        {
+            if (_disposed)
+                return false;
+
+            _fallbackWatcher?.Dispose();
+            _fallbackWatcher = null;
+
+            try
+            {
+                var watcher = new FileSystemWatcher(_store.RootPath)
+                {
+                    IncludeSubdirectories = true,
+                    InternalBufferSize = 64 * 1024,
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.Size
+                };
+
+                watcher.Created += (_, e) => ApplyFallbackChange(e.FullPath, isDelete: false);
+                watcher.Changed += (_, e) => ApplyFallbackChange(e.FullPath, isDelete: false);
+                watcher.Deleted += (_, e) => ApplyFallbackChange(e.FullPath, isDelete: true);
+                watcher.Renamed += (_, e) =>
+                {
+                    // A rename keeps the FRN, so updating the new path moves/renames the existing node (and
+                    // its subtree). Deleting the old path first would tombstone that whole subtree.
+                    if (GetFileIdForPath(e.FullPath) == 0)
+                        ApplyFallbackChange(e.OldFullPath, isDelete: true);
+                    ApplyFallbackChange(e.FullPath, isDelete: false, isRename: true);
+                };
+                watcher.Error += (_, e) => OnWatcherError(watcher, e.GetException());
+                watcher.EnableRaisingEvents = true;
+                _fallbackWatcher = watcher;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                ReportFault($"Live monitoring is unavailable for this volume: {ex.Message}");
+                return false;
+            }
+        }
+    }
+
+    private void OnWatcherError(FileSystemWatcher watcher, Exception ex)
+    {
+        if (ex is InternalBufferOverflowException)
+        {
+            RaiseRescanRequired("The file system watcher buffer overflowed and changes were lost");
+            return;
+        }
+
+        // The watcher is broken (volume dismounted, network share gone): changes were missed, so the drive is stale,
+        // and a new watcher is tried after a pause, again and again with growing patience
+        ReportFault($"File system watcher error: {ex.Message}");
+        RaiseRescanRequired("The file system watcher failed and changes may have been missed");
+
+        if (Interlocked.Exchange(ref _watcherRestarting, 1) == 0)
+            _ = Task.Run(() => RestartWatcherAsync(watcher));
+    }
+
+    private async Task RestartWatcherAsync(FileSystemWatcher broken)
     {
         try
         {
-            _fallbackWatcher = new FileSystemWatcher(_store.RootPath)
+            // Not from inside the watcher's own error callback
+            lock (_watcherLock)
             {
-                IncludeSubdirectories = true,
-                InternalBufferSize = 64 * 1024,
-                NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.Size
-            };
+                if (ReferenceEquals(_fallbackWatcher, broken))
+                    _fallbackWatcher = null;
+                broken.Dispose();
+            }
 
-            _fallbackWatcher.Created += (_, e) => ApplyFallbackChange(e.FullPath, isDelete: false);
-            _fallbackWatcher.Changed += (_, e) => ApplyFallbackChange(e.FullPath, isDelete: false);
-            _fallbackWatcher.Deleted += (_, e) => ApplyFallbackChange(e.FullPath, isDelete: true);
-            _fallbackWatcher.Renamed += (_, e) =>
+            for (int attempt = 0; !_disposed; attempt++)
             {
-                // A rename keeps the FRN, so updating the new path moves/renames the existing node (and
-                // its subtree). Deleting the old path first would tombstone that whole subtree.
-                if (GetFileIdForPath(e.FullPath) == 0)
-                    ApplyFallbackChange(e.OldFullPath, isDelete: true);
-                ApplyFallbackChange(e.FullPath, isDelete: false, isRename: true);
-            };
-            _fallbackWatcher.Error += (_, e) =>
-            {
-                Exception ex = e.GetException();
-                if (ex is InternalBufferOverflowException)
-                    RaiseRescanRequired("The file system watcher buffer overflowed and changes were lost");
-                else
-                    ReportFault($"File system watcher error: {ex.Message}");
-            };
-            _fallbackWatcher.EnableRaisingEvents = true;
+                TimeSpan wait = WatcherRetryDelays[Math.Min(attempt, WatcherRetryDelays.Length - 1)];
+                await Task.Delay(wait, _cts.Token).ConfigureAwait(false);
+
+                if (StartFallbackWatcher())
+                {
+                    AppLog.Info($"{_store.RootPath}: file system watcher recreated after {attempt + 1} attempt(s)");
+                    _lastFaultMessage = null;
+                    Volatile.Write(ref _rescanSignalled, 0); // a later failure may signal again
+                    RaiseStatus(UsnMonitorStatusKind.Recovered, "Live monitoring recovered");
+                    return;
+                }
+                AppLog.Warn($"{_store.RootPath}: could not recreate the file system watcher (attempt {attempt + 1})");
+            }
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException)
+        {
+            // Disposed
         }
         catch (Exception ex)
         {
-            ReportFault($"Live monitoring is unavailable for this volume: {ex.Message}");
+            AppLog.Error($"{_store.RootPath}: watcher restart failed", ex);
+        }
+        finally
+        {
+            Volatile.Write(ref _watcherRestarting, 0);
         }
     }
 
@@ -573,6 +779,7 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         try
         {
             int applied = HandleFallbackEvent(fullPath, isDelete, expandNewDirectory: true, isRename);
+            CheckNameStorage();
             int[] changedNodes = _store.TakeActivity();
             if (applied > 0)
             {
@@ -726,11 +933,51 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
 
     public void Dispose()
     {
-        if (_disposed)
-            return;
-        _disposed = true;
+        lock (_watcherLock)
+        {
+            if (_disposed)
+                return;
+            _disposed = true;
+            _fallbackWatcher?.Dispose();
+            _fallbackWatcher = null;
+        }
         _cts.Cancel();
-        _fallbackWatcher?.Dispose();
         _cts.Dispose();
+    }
+}
+
+internal delegate UsnChunkResult ReadChunkFunc(
+    SafeFileHandle hVolume, IntPtr bufferPtr, ulong journalId, ref long nextUsn, UsnBatch batch, out int win32Error);
+
+internal delegate bool PositionLostFunc(
+    SafeFileHandle hVolume, int readError, ref ulong journalId, ref long nextUsn, out string lostMessage);
+
+/// <summary>The system calls the USN loop makes. The defaults are the real ones; tests replace them to fake a failing volume.</summary>
+internal sealed class MonitorHooks
+{
+    public Func<string, (SafeFileHandle Handle, int Error)> OpenVolumeHandle { get; set; } = path =>
+    {
+        SafeFileHandle h = NtfsNative.CreateFileW(
+            path,
+            NtfsNative.GENERIC_READ,
+            NtfsNative.FILE_SHARE_ALL,
+            IntPtr.Zero,
+            NtfsNative.OPEN_EXISTING,
+            0,
+            IntPtr.Zero);
+        return (h, h.IsInvalid ? Marshal.GetLastWin32Error() : 0);
+    };
+
+    public ReadChunkFunc ReadChunk { get; set; } = UsnJournalReader.ReadChunk;
+
+    public PositionLostFunc IsPositionLost { get; set; } = UsnJournalReader.IsPositionLost;
+
+    public Func<string, bool> RootExists { get; set; } = Directory.Exists;
+
+    public SafeFileHandle OpenVolume(string path, out int error)
+    {
+        (SafeFileHandle handle, int err) = OpenVolumeHandle(path);
+        error = err;
+        return handle;
     }
 }

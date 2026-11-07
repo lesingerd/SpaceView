@@ -98,9 +98,25 @@ public sealed class FileSystemStore
     private int _nodeCount;
     private int _liveCount; // nodes that are not deleted
 
+    // A name handle is (slab index << 20 | offset) in an int, so the slab index must stay below 2048 or the handle wraps
+    // negative. Past the warn limit the store reports that its name storage is nearly full (the drive should be rescanned,
+    // which builds a compact store); the hard limit, well below the cliff, is where no further slab is ever allocated.
+    public const int DefaultNameSlabWarnLimit = 1800;
+    public const int DefaultNameSlabHardLimit = 2040;
+
+    // Names of removed nodes are given back by length and handed out again, so renames and create/delete churn do not
+    // grow the slabs. Exact UTF-8 byte length -> free handles; longer names (never seen on NTFS) are not recycled.
+    private const int MaxReusableNameBytes = 1024;
+    private const int MaxFreeNamesPerLength = 1 << 16;
+    private readonly List<int>?[] _freeNames = new List<int>?[MaxReusableNameBytes + 1];
+    private int _freeNameCount;
+
     private readonly List<byte[]> _nameSlabs = new(32);
     private int _currentSlabIndex = -1;
     private int _currentSlabOffset = NameSlabSize;
+    private int _nameSlabWarnLimit = DefaultNameSlabWarnLimit;
+    private int _nameSlabHardLimit = DefaultNameSlabHardLimit;
+    private volatile bool _nameStorageNearlyFull;
 
     // Sparse paged table mapping 48-bit MFT record number -> nodeId (1-based stored value so 0 means unmapped)
     private readonly int[]?[] _mftPages = new int[MaxPagedMftIndex >> MftPageShift][];
@@ -140,6 +156,37 @@ public sealed class FileSystemStore
     public int PendingFreeCount { get { lock (_syncLock) return _pendingFree.Count; } }
     public int ReusableCount { get { lock (_syncLock) return _reusable.Count; } }
 
+    /// <summary>The number of hard-linked files being tracked (for diagnostics and tests).</summary>
+    public int LinkGroupCount { get { lock (_syncLock) return _linkGroups.Count; } }
+
+    /// <summary>
+    /// True once the name storage has grown to the warn limit (about 1.8 GB of names). The tree is still correct, but the
+    /// drive should be rescanned, which builds a compact store; past the hard limit new names are stored empty
+    /// rather than ever letting a name handle wrap.
+    /// </summary>
+    public bool NameStorageNearlyFull => _nameStorageNearlyFull;
+
+    /// <summary>The number of 1 MB name slabs allocated.</summary>
+    public int NameSlabCount { get { lock (_syncLock) return _nameSlabs.Count; } }
+
+    /// <summary>Bytes held by the name slabs.</summary>
+    public long NameSlabBytes { get { lock (_syncLock) return _nameSlabs.Count * (long)NameSlabSize; } }
+
+    /// <summary>Name slots given back by removed nodes and waiting to be reused (for diagnostics and tests).</summary>
+    public int FreeNameCount { get { lock (_syncLock) return _freeNameCount; } }
+
+    /// <summary>Lowers the slab limits (tests only; the hard limit never exceeds <see cref="DefaultNameSlabHardLimit"/>).</summary>
+    public void ConfigureNameSlabLimits(int warnLimit, int hardLimit)
+    {
+        lock (_syncLock)
+        {
+            _nameSlabHardLimit = Math.Clamp(hardLimit, 1, DefaultNameSlabHardLimit);
+            _nameSlabWarnLimit = Math.Clamp(warnLimit, 1, _nameSlabHardLimit);
+            if (_nameSlabs.Count >= _nameSlabWarnLimit)
+                _nameStorageNearlyFull = true;
+        }
+    }
+
     /// <summary>
     /// A cheap estimate of the memory held by the store: the allocated node chunks, name slabs and FRN pages, plus a rough
     /// per-entry cost for the two dictionaries. It counts allocated arrays, not live nodes.
@@ -166,6 +213,7 @@ public sealed class FileSystemStore
 
                 return chunks * ChunkSize * Unsafe.SizeOf<NodeRecord>() +
                        _nameSlabs.Count * (long)NameSlabSize +
+                       _freeNameCount * (long)sizeof(int) +
                        pages * MftPageSize * sizeof(int) +
                        _overflowFrnMap.Count * 40L +
                        _linkGroups.Count * 96L;
@@ -421,31 +469,72 @@ public sealed class FileSystemStore
             return 0;
         }
 
-        int maxBytes = Encoding.UTF8.GetMaxByteCount(name.Length);
-        if (maxBytes > ushort.MaxValue)
-        {
+        if (Encoding.UTF8.GetMaxByteCount(name.Length) > ushort.MaxValue)
             name = name[..(ushort.MaxValue / 4)];
-            maxBytes = Encoding.UTF8.GetMaxByteCount(name.Length);
+
+        int byteCount = Encoding.UTF8.GetByteCount(name);
+
+        // A slot freed by a removed name of exactly this length is reused before the slabs grow
+        if (byteCount <= MaxReusableNameBytes && _freeNames[byteCount] is { Count: > 0 } free)
+        {
+            int reused = free[^1];
+            free.RemoveAt(free.Count - 1);
+            _freeNameCount--;
+            Encoding.UTF8.GetBytes(name, _nameSlabs[reused >> NameSlabShift].AsSpan(reused & NameSlabMask));
+            byteLen = (ushort)byteCount;
+            return reused;
         }
 
-        if (_currentSlabOffset + maxBytes > NameSlabSize)
+        if (_currentSlabOffset + byteCount > NameSlabSize && !AllocateNewSlab())
         {
-            AllocateNewSlab();
+            // Past the hard limit: the name cannot be stored, but a handle must never wrap
+            byteLen = 0;
+            return 0;
         }
 
         byte[] slab = _nameSlabs[_currentSlabIndex];
-        int written = Encoding.UTF8.GetBytes(name, slab.AsSpan(_currentSlabOffset));
+        Encoding.UTF8.GetBytes(name, slab.AsSpan(_currentSlabOffset));
         int handle = (_currentSlabIndex << NameSlabShift) | _currentSlabOffset;
-        _currentSlabOffset += written;
-        byteLen = (ushort)written;
+        _currentSlabOffset += byteCount;
+        byteLen = (ushort)byteCount;
         return handle;
     }
 
-    private void AllocateNewSlab()
+    /// <summary>Adds a slab; false (nothing added) when the hard limit is reached. Raises <see cref="NameStorageNearlyFull"/> at the warn limit.</summary>
+    private bool AllocateNewSlab()
     {
+        if (_nameSlabs.Count >= _nameSlabHardLimit)
+        {
+            _nameStorageNearlyFull = true;
+            return false;
+        }
+
         _nameSlabs.Add(new byte[NameSlabSize]);
         _currentSlabIndex = _nameSlabs.Count - 1;
         _currentSlabOffset = 0;
+        if (_nameSlabs.Count >= _nameSlabWarnLimit)
+            _nameStorageNearlyFull = true;
+        return true;
+    }
+
+    /// <summary>
+    /// Gives a node's name slot back for reuse and empties the node's name. Names are only ever read under the store lock
+    /// and copied out as strings, so no reader can hold the slot across its reuse. The root's name (slot 0) is never recycled.
+    /// </summary>
+    private void FreeNameUnsafe(int nodeId)
+    {
+        ref NodeRecord rec = ref GetNodeRef(nodeId);
+        int length = rec.NameByteLength;
+        if (nodeId > 0 && length > 0 && length <= MaxReusableNameBytes)
+        {
+            List<int> free = _freeNames[length] ??= new List<int>();
+            if (free.Count < MaxFreeNamesPerLength)
+            {
+                free.Add(rec.NameHandle);
+                _freeNameCount++;
+            }
+        }
+        rec.NameByteLength = 0;
     }
 
     public string GetName(int nodeId)
@@ -980,8 +1069,9 @@ public sealed class FileSystemStore
     /// <summary>
     /// Makes ids reusable. The caller guarantees nothing it owns refers to them. Here the store's own references are
     /// dropped: the FRN map slot of the node (so a lookup can never land on the id's next owner), and the id in the
-    /// activity set. A file that is one name of a hard-linked file keeps its id out of circulation for good, because
-    /// link groups and the carrier hand-over keep ids of deleted names.
+    /// activity set. A name of a hard-linked file also leaves its link group (the group is dropped when fewer than two
+    /// live names remain), and if it was the file's size carrier while other names live on, the size is handed to one
+    /// of them first, so the id can be reused like any other.
     /// </summary>
     public void CommitReclaim(IEnumerable<int> ids)
     {
@@ -996,14 +1086,54 @@ public sealed class FileSystemStore
                 if (!rec.IsDeleted)
                     continue; // already reused or never deleted: nothing to do
 
-                if (!rec.IsDirectory && rec.FileId != 0 && _linkGroups.ContainsKey(rec.FileId))
-                    continue;
+                if (!rec.IsDirectory && rec.FileId != 0 && _linkGroups.TryGetValue(rec.FileId, out List<int>? linkGroup))
+                    ForgetLinkNameUnsafe(id, rec.FileId, rec.Size, linkGroup);
 
                 UnmapFileIdInternal(rec.FileId, id);
                 _activity.Remove(id);
+                FreeNameUnsafe(id);
                 _reusable.Add(id);
             }
         }
+    }
+
+    /// <summary>
+    /// A deleted name of a hard-linked file is about to lose its id (see <see cref="CommitReclaim"/>): takes it out of the
+    /// file's link group, hands the file's size and FRN map slot to a live name if this one was the carrier (a carrier
+    /// tombstoned inside a deleted subtree is not handed over at the time), and drops the group once it has fewer than
+    /// two live names.
+    /// </summary>
+    private void ForgetLinkNameUnsafe(int nodeId, ulong fileId, long size, List<int> group)
+    {
+        bool wasCarrier = TryGetMappedNodeUnsafe(fileId, out int carrierId) && carrierId == nodeId;
+        group.RemoveAll(m => m == nodeId);
+
+        int heirId = -1;
+        int live = 0;
+        foreach (int member in group)
+        {
+            ref NodeRecord candidate = ref GetNodeRef(member);
+            if (!candidate.IsDeleted && candidate.FileId == fileId)
+            {
+                live++;
+                if (heirId < 0)
+                    heirId = member;
+            }
+        }
+
+        if (wasCarrier && heirId >= 0)
+        {
+            GetNodeRef(heirId).Size = size;
+            MapFileIdInternal(fileId, heirId);
+            if (size != 0)
+            {
+                PropagateDeltaUnsafe(GetNodeRef(heirId).ParentId, size, 0, 0);
+                NoteActivityUnsafe(heirId); // its size changed: the UI refreshes it and its ancestors
+            }
+        }
+
+        if (live < 2)
+            _linkGroups.Remove(fileId);
     }
 
     // =========================================================================
@@ -1108,10 +1238,16 @@ public sealed class FileSystemStore
 
                 if (!linkRecord && !fileName.IsEmpty && !NameEqualsUnsafe(existingNodeId, fileName))
                 {
+                    // The new name is written first (the old one stays if the name storage is exhausted); the old slot
+                    // then goes back to the free lists
                     int newHandle = WriteNameUtf8(fileName, out ushort byteLen);
-                    ref NodeRecord recAfterWrite = ref GetNodeRef(existingNodeId);
-                    recAfterWrite.NameHandle = newHandle;
-                    recAfterWrite.NameByteLength = byteLen;
+                    if (byteLen > 0)
+                    {
+                        FreeNameUnsafe(existingNodeId);
+                        ref NodeRecord recAfterWrite = ref GetNodeRef(existingNodeId);
+                        recAfterWrite.NameHandle = newHandle;
+                        recAfterWrite.NameByteLength = byteLen;
+                    }
                 }
 
                 // A failed size read must not zero the node: keep the old size

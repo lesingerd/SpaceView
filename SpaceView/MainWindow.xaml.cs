@@ -224,6 +224,8 @@ public partial class MainWindow : Window
         _statsLogTimer.Tick += (_, _) => LogStoreStats();
         _statsLogTimer.Start();
 
+        StartDriveRefreshTimers();
+
         Loaded += (_, _) =>
         {
             // Open the drive dropdown on initial launch so the user immediately sees drives to select
@@ -301,7 +303,90 @@ public partial class MainWindow : Window
             StatusTextBlock.Text = $"Not available, skipped: {string.Join(", ", missing)}";
     }
 
+    // Free space and total size change, drives come and go, and a machine that runs for weeks sleeps and wakes: the drive
+    // list is refreshed every minute and shortly after Windows reports a device arriving or leaving.
+    private static readonly TimeSpan DriveRefreshInterval = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan DeviceChangeDebounce = TimeSpan.FromSeconds(2);
+    // A drive must be missing from two refreshes in a row before it counts as gone (a resume from sleep can hide drives
+    // for a moment); a missing drive makes the next refresh come early, so a real removal is not noticed a minute late
+    private static readonly TimeSpan DriveMissConfirmDelay = TimeSpan.FromSeconds(5);
+    private DispatcherTimer? _driveRefreshTimer;
+    private DispatcherTimer? _deviceChangeTimer;
+    private bool _driveRefreshRunning;
+    private bool _driveRefreshQueued;
+    private readonly Dictionary<DriveSession, int> _driveMisses = new();
+
+    private void StartDriveRefreshTimers()
+    {
+        _driveRefreshTimer = new DispatcherTimer { Interval = DriveRefreshInterval };
+        _driveRefreshTimer.Tick += (_, _) =>
+        {
+            // Replacing the list while the dropdown is open would pull it out from under the user; the next tick catches up
+            if (DriveComboBox.IsDropDownOpen || _driveRefreshRunning || _isExiting)
+                return;
+            _ = ObserveAsync(RefreshDriveListAsync(preserveSelection: true), "Drive refresh");
+        };
+        _driveRefreshTimer.Start();
+
+        _deviceChangeTimer = new DispatcherTimer { Interval = DeviceChangeDebounce };
+        _deviceChangeTimer.Tick += (_, _) =>
+        {
+            _deviceChangeTimer.Stop();
+            if (_isExiting)
+                return;
+            if (DriveComboBox.IsDropDownOpen)
+            {
+                _deviceChangeTimer.Start(); // try again once the dropdown is closed
+                return;
+            }
+            _ = ObserveAsync(RefreshDriveListAsync(preserveSelection: true), "Drive refresh");
+        };
+    }
+
+    /// <summary>Windows reported a device arriving or leaving: refresh the drive list once the burst of messages is over.</summary>
+    private void OnDeviceChanged()
+    {
+        if (_deviceChangeTimer == null || _isExiting)
+            return;
+        _deviceChangeTimer.Interval = DeviceChangeDebounce;
+        _deviceChangeTimer.Stop();
+        _deviceChangeTimer.Start();
+    }
+
+    /// <summary>Refreshes the drive list; one refresh runs at a time, and a request that arrives meanwhile runs once more afterwards.</summary>
     private async Task RefreshDriveListAsync(bool preserveSelection)
+    {
+        if (_driveRefreshRunning)
+        {
+            _driveRefreshQueued = true;
+            return;
+        }
+
+        _driveRefreshRunning = true;
+        try
+        {
+            bool confirmMiss = await RefreshDriveListCoreAsync(preserveSelection);
+            while (_driveRefreshQueued)
+            {
+                _driveRefreshQueued = false;
+                confirmMiss = await RefreshDriveListCoreAsync(preserveSelection) || confirmMiss;
+            }
+
+            if (confirmMiss && _deviceChangeTimer != null && !_isExiting)
+            {
+                _deviceChangeTimer.Stop();
+                _deviceChangeTimer.Interval = DriveMissConfirmDelay;
+                _deviceChangeTimer.Start();
+            }
+        }
+        finally
+        {
+            _driveRefreshRunning = false;
+        }
+    }
+
+    /// <summary>Returns true when a drive was missing for the first time, so the caller should look again soon.</summary>
+    private async Task<bool> RefreshDriveListCoreAsync(bool preserveSelection)
     {
         DriveEnumeration result;
         try
@@ -310,7 +395,7 @@ public partial class MainWindow : Window
         }
         catch
         {
-            return;
+            return false;
         }
 
         // Read the selection only now: the user may have picked another drive while the drives were being queried
@@ -340,11 +425,13 @@ public partial class MainWindow : Window
         // Drives in the tree that are no longer in the list: keep showing them, but say so and stop watching a volume
         // that is gone. Drives that merely answered too slowly stay in the list. A drive that is being scanned is left alone.
         var gone = new List<string>();
+        bool firstMiss = false;
         foreach (DriveSession session in _sessions)
         {
             DriveItemViewModel? drive = result.Drives.FirstOrDefault(d => DriveSession.SameRoot(d.Name, session.RootPath));
             if (drive != null)
             {
+                _driveMisses.Remove(session);
                 ApplyVolumeInfo(session, drive);
                 if (session.IsUnavailable)
                     AppLog.Info($"Drive {session.RootPath} is available again (marked stale)");
@@ -352,11 +439,29 @@ public partial class MainWindow : Window
             }
             else if (!session.IsBusy && !session.IsUnavailable)
             {
-                AppLog.Warn($"Drive {session.RootPath} is no longer available; live monitoring stopped");
-                session.MarkUnavailable();
-                gone.Add(session.RootPath);
+                int misses = _driveMisses.GetValueOrDefault(session) + 1;
+                _driveMisses[session] = misses;
+                if (misses >= 2)
+                {
+                    _driveMisses.Remove(session);
+                    AppLog.Warn($"Drive {session.RootPath} is no longer available; live monitoring stopped");
+                    session.MarkUnavailable();
+                    gone.Add(session.RootPath);
+                }
+                else
+                {
+                    AppLog.Info($"Drive {session.RootPath} was missing from the drive list (first time); checking again shortly");
+                    firstMiss = true;
+                }
             }
             RefreshRootRow(session);
+        }
+
+        // Sessions that were removed from the view must not stay in the miss counts
+        if (_driveMisses.Count > 0)
+        {
+            foreach (DriveSession stale in _driveMisses.Keys.Where(s => !_sessions.Contains(s)).ToList())
+                _driveMisses.Remove(stale);
         }
 
         if (gone.Count > 0)
@@ -370,6 +475,7 @@ public partial class MainWindow : Window
 
         UpdateMonitorBadge();
         UpdateElevationUi();
+        return firstMiss;
     }
 
     private static void ApplyVolumeInfo(DriveSession session, DriveItemViewModel drive) =>
@@ -2519,6 +2625,8 @@ public partial class MainWindow : Window
     {
         _memoryTimer.Stop();
         _statsLogTimer.Stop();
+        _driveRefreshTimer?.Stop();
+        _deviceChangeTimer?.Stop();
         ReleaseClipboardNotifications();
         _branchCts?.Cancel();
         foreach (DriveSession session in _sessions)

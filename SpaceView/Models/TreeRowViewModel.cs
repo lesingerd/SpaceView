@@ -7,7 +7,7 @@ using Color = System.Windows.Media.Color;
 
 namespace SpaceView.Models;
 
-public sealed class TreeRowViewModel : INotifyPropertyChanged
+public sealed class TreeRowViewModel : INotifyPropertyChanged, ILiveRow
 {
     private static readonly SolidColorBrush HighUsageBrush = CreateFrozenBrush(244, 63, 94);    // Rose
     private static readonly SolidColorBrush MedHighUsageBrush = CreateFrozenBrush(245, 158, 11); // Amber
@@ -319,6 +319,33 @@ public sealed class TreeRowViewModel : INotifyPropertyChanged
         }
 
         NodeSnapshot snapshot = _store!.GetNodeInfo(NodeId);
+        Name = snapshot.Name;
+        Size = snapshot.Size;
+        FileCount = snapshot.FileCount;
+        FolderCount = snapshot.FolderCount;
+        PercentOfParent = ComputePercent(snapshot);
+    }
+
+    /// <summary>Takes size, counts and percentage from numbers already read from the store (the name is left alone).</summary>
+    public void ApplyValues(in NodeRowValues values)
+    {
+        if (IsMoreRow || IsRoot)
+            return;
+
+        Size = values.Size;
+        FileCount = values.FileCount;
+        FolderCount = values.FolderCount;
+        PercentOfParent = values.ParentId < 0 ? 100.0
+            : values.ParentSize <= 0 ? 0.0
+            : Math.Clamp((double)values.Size / values.ParentSize * 100.0, 0.0, 100.0);
+    }
+
+    /// <summary>Takes everything from a snapshot read from the store, the name included.</summary>
+    public void ApplySnapshot(in NodeSnapshot snapshot)
+    {
+        if (IsMoreRow || IsRoot)
+            return;
+
         Name = snapshot.Name;
         Size = snapshot.Size;
         FileCount = snapshot.FileCount;

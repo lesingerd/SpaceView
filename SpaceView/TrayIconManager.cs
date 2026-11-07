@@ -62,7 +62,7 @@ public sealed class TrayIconManager : IDisposable
         _notifyIcon.MouseMove += OnNotifyIconMouseMove;
         _notifyIcon.MouseClick += OnNotifyIconMouseClick;
 
-        _hoverWatchTimer = new DispatcherTimer
+        _hoverWatchTimer = new DispatcherTimer(System.Windows.Threading.DispatcherPriority.Input)
         {
             Interval = TimeSpan.FromMilliseconds(120)
         };

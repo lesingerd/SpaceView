@@ -245,6 +245,65 @@ public sealed class DriveSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// Like <see cref="TakeActivity()"/>, but takes at most <paramref name="max"/> nodes; the rest stay for the next pass
+    /// (<paramref name="more"/>). <paramref name="overflow"/> is set when the collection hit its cap: nodes were dropped,
+    /// so the set does not describe every change and the pass must look at everything. Then all nodes are taken.
+    /// </summary>
+    public HashSet<int> TakeActivity(int max, out bool overflow, out bool more)
+    {
+        lock (_activityLock)
+        {
+            HashSet<int> pending = _pendingActivity;
+            overflow = pending.Count >= FileSystemStore.MaxActivityNodes;
+            more = false;
+            if (pending.Count <= max || overflow)
+            {
+                if (pending.Count > 0)
+                    _pendingActivity = new HashSet<int>();
+                return pending;
+            }
+
+            var taken = new HashSet<int>();
+            foreach (int node in pending)
+            {
+                if (taken.Count >= max)
+                    break;
+                taken.Add(node);
+            }
+            pending.ExceptWith(taken);
+            more = pending.Count > 0;
+            return taken;
+        }
+    }
+
+    /// <summary>Drops node ids that are about to be reused for other nodes from the collected activity.</summary>
+    public void ForgetActivity(IEnumerable<int> nodes)
+    {
+        lock (_activityLock)
+        {
+            foreach (int node in nodes)
+                _pendingActivity.Remove(node);
+        }
+    }
+
+    /// <summary>Set (UI thread) when the next pass cannot rely on the collected changed nodes alone: it then checks every row and folder.</summary>
+    public bool NeedsFullSync { get; set; }
+
+    private long _lastPassEndMs;
+    private long _lastPassDurationMs;
+
+    /// <summary>Notes how long a live-update pass took and when it ended (UI thread), for <see cref="PassDelayMs"/>.</summary>
+    public void RecordPass(long endMs, long durationMs)
+    {
+        Volatile.Write(ref _lastPassDurationMs, durationMs);
+        Volatile.Write(ref _lastPassEndMs, endMs);
+    }
+
+    /// <summary>Milliseconds to wait before the next live-update pass may run (any thread).</summary>
+    public int PassDelayMs(long nowMs) =>
+        PassPacer.DelayMs(nowMs, Volatile.Read(ref _lastPassEndMs), Volatile.Read(ref _lastPassDurationMs));
+
     /// <summary>Forgets the collected nodes (the store was replaced or a branch was grafted: they no longer describe live changes).</summary>
     public void ClearActivity()
     {

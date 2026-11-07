@@ -45,3 +45,6 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+
+# Claude Code agent worktrees
+.claude/worktrees/

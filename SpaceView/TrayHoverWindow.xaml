@@ -24,6 +24,31 @@
                 </Grid>
             </Border>
         </ControlTemplate>
+
+        <!-- Dark tooltip -->
+        <Style TargetType="ToolTip">
+            <Setter Property="Foreground" Value="#E2E8F0"/>
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="MaxWidth" Value="260"/>
+            <Setter Property="HasDropShadow" Value="False"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ToolTip">
+                        <Border Background="#0F172A" BorderBrush="#334155" BorderThickness="1"
+                                CornerRadius="6" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter>
+                                <ContentPresenter.ContentTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding}" TextWrapping="Wrap"/>
+                                    </DataTemplate>
+                                </ContentPresenter.ContentTemplate>
+                            </ContentPresenter>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
     </Window.Resources>
     <Grid>
         <Border Margin="10"
@@ -123,7 +148,9 @@
             </ItemsControl>
 
             <!-- Memory section (hidden when the system call fails) -->
-            <StackPanel x:Name="MemorySection" Visibility="Collapsed">
+            <StackPanel x:Name="MemorySection" Visibility="Collapsed"
+                        ToolTipService.InitialShowDelay="300"
+                        ToolTipService.ShowDuration="20000">
                 <Border Height="1" Background="#1E293B" Margin="0,1,0,8"/>
                 <TextBlock Text="Memory"
                            Foreground="#F8FAFC"
@@ -141,12 +168,14 @@
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
                             <TextBlock Text="{Binding HeaderText}"
+                                       ToolTip="Total RAM installed and usable by Windows."
                                        Foreground="#F1F5F9"
                                        FontWeight="SemiBold"
                                        FontSize="12"
                                        TextTrimming="CharacterEllipsis"/>
                             <TextBlock Grid.Column="1"
                                        Text="{Binding AvailableSummary}"
+                                       ToolTip="Memory that can be given to programs right now without paging anything out. It is the cached and free memory together."
                                        Foreground="#38BDF8"
                                        FontWeight="SemiBold"
                                        FontSize="11.5"
@@ -154,7 +183,8 @@
                         </Grid>
 
                         <!-- Muted underlay = in use + cached, solid overlay = in use, track = free -->
-                        <Grid Height="8">
+                        <Grid Height="8" Background="Transparent"
+                              ToolTip="Solid: in use. Grey: cached. Empty: free.">
                             <ProgressBar Minimum="0" Maximum="100"
                                          Value="{Binding InUseAndCachedPercentage, Mode=OneWay}"
                                          Background="#0F172A"
@@ -169,13 +199,26 @@
                                          Template="{StaticResource PageFileBarTemplate}"/>
                         </Grid>
 
-                        <TextBlock Text="{Binding DetailText}"
-                                   Foreground="#94A3B8"
-                                   FontSize="10.5"
-                                   Margin="0,4,0,0"/>
+                        <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                            <StackPanel.Resources>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Foreground" Value="#94A3B8"/>
+                                    <Setter Property="FontSize" Value="10.5"/>
+                                </Style>
+                            </StackPanel.Resources>
+                            <TextBlock Text="{Binding InUseText}"
+                                       ToolTip="Memory currently held by running programs, drivers and Windows itself. It cannot be reused until its owner frees it."/>
+                            <TextBlock Text="  •  "/>
+                            <TextBlock Text="{Binding CachedText}"
+                                       ToolTip="Recently used file and program data that Windows keeps in RAM to speed things up. It is handed to programs instantly when they need it."/>
+                            <TextBlock Text="  •  "/>
+                            <TextBlock Text="{Binding FreeText}"
+                                       ToolTip="Memory holding nothing at all. Windows keeps this small on purpose, because unused RAM is wasted RAM."/>
+                        </StackPanel>
 
                         <!-- Commit charge: light underlay = peak, solid = current -->
-                        <Grid Height="6" Margin="0,6,0,0">
+                        <Grid Height="6" Margin="0,6,0,0" Background="Transparent"
+                              ToolTip="Solid: committed now. Light: peak since startup. Full width is the commit limit.">
                             <ProgressBar Minimum="0" Maximum="100"
                                          Value="{Binding CommitPeakPercentage, Mode=OneWay}"
                                          Background="#0F172A"
@@ -190,11 +233,22 @@
                                          Template="{StaticResource PageFileBarTemplate}"/>
                         </Grid>
 
-                        <TextBlock Text="{Binding CommitText}"
-                                   Foreground="#94A3B8"
-                                   FontSize="10.5"
-                                   TextWrapping="Wrap"
-                                   Margin="0,4,0,0"/>
+                        <WrapPanel Margin="0,4,0,0">
+                            <WrapPanel.Resources>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Foreground" Value="#94A3B8"/>
+                                    <Setter Property="FontSize" Value="10.5"/>
+                                </Style>
+                            </WrapPanel.Resources>
+                            <TextBlock Text="{Binding CommittedText}"
+                                       ToolTip="Memory that programs have reserved and Windows has promised to back with RAM or the page file. If it reaches the limit, programs can fail to allocate memory."/>
+                            <TextBlock Text=" "/>
+                            <TextBlock Text="{Binding CommitLimitText}"
+                                       ToolTip="The most memory Windows can promise: physical RAM plus the current page file size. A larger page file raises it."/>
+                            <TextBlock Text="  •  "/>
+                            <TextBlock Text="{Binding PeakText}"
+                                       ToolTip="The highest committed total since Windows started. It can sit above today's limit if the page file was larger earlier."/>
+                        </WrapPanel>
                     </StackPanel>
                 </Border>
             </StackPanel>

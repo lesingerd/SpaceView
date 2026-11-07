@@ -28,8 +28,12 @@ public sealed class MemoryStatusViewModel
 
     public string HeaderText { get; }
     public string AvailableSummary { get; }
-    public string DetailText { get; }
-    public string CommitText { get; }
+    public string InUseText { get; }
+    public string CachedText { get; }
+    public string FreeText { get; }
+    public string CommittedText { get; }
+    public string CommitLimitText { get; }
+    public string PeakText { get; }
 
     public SolidColorBrush UsedBrush { get; }
     public SolidColorBrush CachedBrush { get; }
@@ -54,8 +58,12 @@ public sealed class MemoryStatusViewModel
 
         HeaderText = $"Physical memory  •  {SizeFormatter.FormatBytes(TotalBytes)}";
         AvailableSummary = $"{SizeFormatter.FormatBytes(AvailableBytes)} available ({AvailablePercentage:0.0}%)";
-        DetailText = $"In use {SizeFormatter.FormatBytes(InUseBytes)}  •  Cached {SizeFormatter.FormatBytes(CacheBytes)}  •  Free {SizeFormatter.FormatBytes(FreeBytes)}";
-        CommitText = $"Committed {SizeFormatter.FormatBytes(CommitTotalBytes)} / {SizeFormatter.FormatBytes(CommitLimitBytes)}  •  Peak {SizeFormatter.FormatBytes(CommitPeakBytes)}";
+        InUseText = $"In use {SizeFormatter.FormatBytes(InUseBytes)}";
+        CachedText = $"Cached {SizeFormatter.FormatBytes(CacheBytes)}";
+        FreeText = $"Free {SizeFormatter.FormatBytes(FreeBytes)}";
+        CommittedText = $"Committed {SizeFormatter.FormatBytes(CommitTotalBytes)}";
+        CommitLimitText = $"/ {SizeFormatter.FormatBytes(CommitLimitBytes)}";
+        PeakText = $"Peak {SizeFormatter.FormatBytes(CommitPeakBytes)}";
 
         UsedBrush = Frozen(ThresholdColor(InUsePercentage));
         CommitBrush = Frozen(ThresholdColor(CommitPercentage));

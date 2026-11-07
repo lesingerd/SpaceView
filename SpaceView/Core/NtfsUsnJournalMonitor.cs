@@ -297,6 +297,8 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         }
         backlog.Batch.Clear(); // the records are applied; free the memory
 
+        AppLog.Info($"{_store.RootPath}: journal backlog applied ({applied:N0} changes)" +
+                    (backlog.FailureReason != null ? $"; the drain had lost changes: {backlog.FailureReason}" : string.Empty));
         BacklogApplied?.Invoke(this, applied);
         if (backlog.FailureReason != null)
             RaiseRescanRequired(backlog.FailureReason);
@@ -461,6 +463,7 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         if (Interlocked.Exchange(ref _rescanSignalled, 1) == 1)
             return;
 
+        AppLog.Warn($"{_store.RootPath}: rescan required: {reason}");
         RescanRequired?.Invoke(this, reason);
     }
 
@@ -471,6 +474,7 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
             return;
 
         _lastFaultMessage = message;
+        AppLog.Warn($"{_store.RootPath}: monitor fault: {message}");
         StatusChanged?.Invoke(this, new UsnMonitorStatusEventArgs
         {
             Kind = UsnMonitorStatusKind.Fault,
@@ -481,6 +485,7 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
     private void SwitchToFallback(string reason)
     {
         _usnActive = false;
+        AppLog.Warn($"{_store.RootPath}: fell back to the file system watcher: {reason}");
         StartFallbackWatcher();
         StatusChanged?.Invoke(this, new UsnMonitorStatusEventArgs
         {

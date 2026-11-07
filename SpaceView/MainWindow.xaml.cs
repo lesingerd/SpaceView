@@ -160,6 +160,7 @@ public partial class MainWindow : Window
     private readonly BulkObservableCollection<TreeRowViewModel> _visibleRows = new();
     private readonly TrayIconManager _trayManager;
     private readonly DispatcherTimer _memoryTimer;
+    private readonly DispatcherTimer _statsLogTimer;
 
     // One tree, one root row per scanned drive; the first session is the most recently chosen drive. Every row resolves
     // its own session, and NodeIds are only unique per store, so rows are compared together with their session (RowKey).
@@ -208,7 +209,7 @@ public partial class MainWindow : Window
 
         LoadShieldIcon();
 
-        _ = StartupAsync();
+        _ = ObserveAsync(StartupAsync(), "Startup");
 
         _memoryTimer = new DispatcherTimer
         {
@@ -217,6 +218,11 @@ public partial class MainWindow : Window
         _memoryTimer.Tick += (_, _) => UpdateMemoryUsageDisplay();
         _memoryTimer.Start();
         UpdateMemoryUsageDisplay();
+
+        // Long runs: a line per drive about the store's reuse bookkeeping, once an hour (never per event)
+        _statsLogTimer = new DispatcherTimer { Interval = TimeSpan.FromHours(1) };
+        _statsLogTimer.Tick += (_, _) => LogStoreStats();
+        _statsLogTimer.Start();
 
         Loaded += (_, _) =>
         {
@@ -340,10 +346,13 @@ public partial class MainWindow : Window
             if (drive != null)
             {
                 ApplyVolumeInfo(session, drive);
+                if (session.IsUnavailable)
+                    AppLog.Info($"Drive {session.RootPath} is available again (marked stale)");
                 session.MarkAvailableAgain();
             }
             else if (!session.IsBusy && !session.IsUnavailable)
             {
+                AppLog.Warn($"Drive {session.RootPath} is no longer available; live monitoring stopped");
                 session.MarkUnavailable();
                 gone.Add(session.RootPath);
             }
@@ -527,6 +536,42 @@ public partial class MainWindow : Window
     /// </summary>
     private async Task StartSessionScanAsync(DriveSession session, string? rescanReason = null)
     {
+        try
+        {
+            await ScanSessionAsync(session, rescanReason);
+        }
+        catch (Exception ex)
+        {
+            // Fire-and-forget callers cannot observe this: log it and show it
+            AppLog.Error($"Scan of {session.RootPath} failed unexpectedly", ex);
+            if (!session.IsDisposed)
+            {
+                session.Fail(ex.Message);
+                RefreshRootRow(session);
+                StatusTextBlock.Text = $"Error scanning {session.RootPath}: {ex.Message}";
+            }
+        }
+    }
+
+    /// <summary>Awaits a task started without an await and logs and shows its failure instead of dropping it.</summary>
+    private async Task ObserveAsync(Task task, string what)
+    {
+        try
+        {
+            await task;
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error($"{what} failed", ex);
+            StatusTextBlock.Text = $"{what} failed: {ex.Message} (see spaceview.log)";
+        }
+    }
+
+    private async Task ScanSessionAsync(DriveSession session, string? rescanReason)
+    {
         if (session.IsDisposed)
             return;
 
@@ -540,6 +585,7 @@ public partial class MainWindow : Window
         StatusTextBlock.Text = $"{session.RootPath} queued for scanning...";
 
         bool gateHeld = false;
+        Stopwatch? scanTimer = null;
         try
         {
             await _scanGate.WaitAsync(ct);
@@ -548,6 +594,8 @@ public partial class MainWindow : Window
                 return;
 
             session.MarkScanning();
+            scanTimer = Stopwatch.StartNew();
+            AppLog.Info($"Scan started: {session.RootPath}" + (rescanReason != null ? $" (rescan: {rescanReason})" : string.Empty));
             RefreshRootRow(session);
             StatusTextBlock.Text = rescanReason != null
                 ? $"{rescanReason}. Rescanning {session.RootPath}..."
@@ -565,6 +613,7 @@ public partial class MainWindow : Window
             if (!ready)
             {
                 // Scanning a volume that is gone would replace a good tree with an empty one
+                AppLog.Warn($"Scan of {session.RootPath} not started: the drive is not ready");
                 if (session.Store != null)
                 {
                     session.MarkUnavailable();
@@ -602,9 +651,12 @@ public partial class MainWindow : Window
         catch (OperationCanceledException)
         {
             // Scan superseded by another one, or its drive was removed from the view
+            if (scanTimer != null)
+                AppLog.Info($"Scan cancelled: {session.RootPath} after {scanTimer.Elapsed.TotalSeconds:0.0} s");
         }
         catch (Exception ex)
         {
+            AppLog.Error($"Scan failed: {session.RootPath} after {scanTimer?.Elapsed.TotalSeconds ?? 0:0.0} s", ex);
             if (session.IsCurrentScan(cts))
             {
                 session.Fail(ex.Message);
@@ -627,6 +679,11 @@ public partial class MainWindow : Window
         bool expandRoot = firstLoad
             ? _sessions.Count > 0 && ReferenceEquals(_sessions[0], session)
             : _rootRows.TryGetValue(session, out TreeRowViewModel? existing) && existing.IsExpanded;
+
+        AppLog.Info($"Scan finished: {session.RootPath} in {result.Duration.TotalSeconds:0.0} s, " +
+                    $"{result.Store.LiveNodeCount:N0} nodes, {result.InaccessibleDirectories:N0} inaccessible folders, " +
+                    $"ntfs={result.IsNtfs}, usnReady={result.UsnJournalReady}, journalBacklog={result.UsnBacklog?.Batch.Items.Count ?? 0:N0}" +
+                    (result.UsnBacklog?.FailureReason != null ? $" (drain lost changes: {result.UsnBacklog.FailureReason})" : string.Empty));
 
         session.DetachMonitor();
         session.ApplyScanResult(result);
@@ -2445,6 +2502,7 @@ public partial class MainWindow : Window
     private void CleanupResources()
     {
         _memoryTimer.Stop();
+        _statsLogTimer.Stop();
         ReleaseClipboardNotifications();
         _branchCts?.Cancel();
         foreach (DriveSession session in _sessions)
@@ -2452,6 +2510,21 @@ public partial class MainWindow : Window
             session.Dispose();
         }
         _trayManager.Dispose();
+    }
+
+    private void LogStoreStats()
+    {
+        foreach (DriveSession session in _sessions)
+        {
+            FileSystemStore? store = session.Store;
+            if (store == null)
+                continue;
+
+            AppLog.Info($"Store {session.RootPath}: live nodes {store.LiveNodeCount:N0} of {store.TotalNodeCount:N0} ids, " +
+                        $"pending free {store.PendingFreeCount:N0}, reusable {store.ReusableCount:N0}, " +
+                        $"~{SizeFormatter.FormatBytes(store.EstimatedMemoryBytes)} in memory, " +
+                        $"events {session.Monitor?.TotalEventsProcessed ?? 0:N0}");
+        }
     }
 
     private void UpdateMemoryUsageDisplay()

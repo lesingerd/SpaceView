@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -69,6 +68,100 @@ public static class VolumeScanner
         }
     }
 
+    /// <summary>
+    /// Directory work queue shared by the scan workers. Idle workers sleep on a monitor instead of spinning; the scan is
+    /// over when no directory is queued and none is still being listed (<see cref="Pending"/> reaches 0).
+    /// </summary>
+    private sealed class ScanQueue
+    {
+        private readonly object _gate = new();
+        private readonly Queue<(int NodeId, string Path)> _items = new();
+        private int _pending;
+
+        /// <summary>Directories queued or currently being listed.</summary>
+        public int Pending => Volatile.Read(ref _pending);
+
+        public void Add(int nodeId, string path)
+        {
+            lock (_gate)
+            {
+                _pending++;
+                _items.Enqueue((nodeId, path));
+                Monitor.Pulse(_gate);
+            }
+        }
+
+        /// <summary>Marks one taken directory as finished; wakes the sleeping workers when it was the last one.</summary>
+        public void Complete()
+        {
+            lock (_gate)
+            {
+                if (--_pending == 0)
+                    Monitor.PulseAll(_gate);
+            }
+        }
+
+        public void WakeAll()
+        {
+            lock (_gate)
+            {
+                Monitor.PulseAll(_gate);
+            }
+        }
+
+        /// <summary>Blocks until a directory is available. False when the scan is finished or cancelled.</summary>
+        public bool TryTake(CancellationToken ct, out (int NodeId, string Path) item)
+        {
+            lock (_gate)
+            {
+                while (true)
+                {
+                    if (ct.IsCancellationRequested)
+                    {
+                        item = default;
+                        return false;
+                    }
+                    if (_items.Count > 0)
+                    {
+                        item = _items.Dequeue();
+                        return true;
+                    }
+                    if (_pending == 0)
+                    {
+                        item = default;
+                        return false;
+                    }
+                    Monitor.Wait(_gate);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// How many scan workers to run for the volume holding <paramref name="path"/>. The system volume gets fewer: it
+    /// carries the most filter drivers (antivirus, anti-cheat, backup, cloud sync, VSS), and more concurrent directory
+    /// opens only lengthen the time its volume locks are contended without making the scan finish sooner.
+    /// </summary>
+    internal static int GetScanWorkerCount(string path)
+    {
+        const int SystemVolumeWorkers = 4;
+        try
+        {
+            string? root = Path.GetPathRoot(Path.GetFullPath(path));
+            string? systemRoot = Path.GetPathRoot(Environment.SystemDirectory);
+            if (root != null && systemRoot != null && string.Equals(root, systemRoot, StringComparison.OrdinalIgnoreCase))
+                return SystemVolumeWorkers;
+        }
+        catch
+        {
+            // An unusual path: fall through to the general count
+        }
+        return Math.Clamp(Environment.ProcessorCount, 2, 8);
+    }
+
+    /// <summary>Test hook: runs on each scan worker thread right after it has entered background mode.</summary>
+    internal static Action? WorkerStartedHook { get; set; }
+
     static VolumeScanner()
     {
         NtfsNative.EnableBackupPrivilege();
@@ -138,19 +231,15 @@ public static class VolumeScanner
         ulong rootFileId = GetDirectoryFileId(rootPath);
         var store = new FileSystemStore(rootPath, rootFileId);
 
-        var workQueue = new ConcurrentQueue<(int NodeId, string Path)>();
-        int pendingDirectories = 1;
-        workQueue.Enqueue((store.RootNodeId, store.RootPath));
+        var workQueue = new ScanQueue();
+        workQueue.Add(store.RootNodeId, store.RootPath);
 
-        // At most 8: idle workers spin while the queue is empty, and 16 open directory handles only queue up on the
-        // disk. Drives are scanned one at a time (see MainWindow), so more workers would not make the whole faster.
-        int workerCount = Math.Clamp(Environment.ProcessorCount, 2, 8);
-        var workers = new Task[workerCount];
+        int workerCount = GetScanWorkerCount(rootPath);
 
         using var progressCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var progressTask = Task.Run(async () =>
         {
-            while (!progressCts.Token.IsCancellationRequested && Volatile.Read(ref pendingDirectories) > 0)
+            while (!progressCts.Token.IsCancellationRequested && workQueue.Pending > 0)
             {
                 try
                 {
@@ -170,12 +259,23 @@ public static class VolumeScanner
             }
         }, CancellationToken.None);
 
+        // Dedicated background threads rather than pool threads: background processing mode (low I/O and memory
+        // priority) is per thread and must be left on the thread that entered it. Idle workers sleep in the queue;
+        // cancellation wakes them.
+        using var wakeOnCancel = cancellationToken.Register(workQueue.WakeAll);
+        var workers = new Thread[workerCount];
         for (int w = 0; w < workerCount; w++)
         {
-            workers[w] = Task.Run(() => RunWorker(store, workQueue, ref pendingDirectories, counters, cancellationToken), CancellationToken.None);
+            workers[w] = new Thread(() => RunWorker(store, workQueue, counters, cancellationToken))
+            {
+                IsBackground = true,
+                Name = $"SpaceView scan worker {w + 1}"
+            };
+            workers[w].Start();
         }
 
-        Task.WaitAll(workers);
+        foreach (Thread worker in workers)
+            worker.Join();
         progressCts.Cancel();
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -204,61 +304,61 @@ public static class VolumeScanner
 
     private static unsafe void RunWorker(
         FileSystemStore store,
-        ConcurrentQueue<(int NodeId, string Path)> workQueue,
-        ref int pendingDirectories,
+        ScanQueue workQueue,
         ScanCounters? counters,
         CancellationToken cancellationToken)
     {
-        byte* buffer = (byte*)NativeMemory.AlignedAlloc(BufferSize, 8);
-        var batchEntries = new List<PendingChildEntry>(256);
-        var dirNames = new List<string>(64);
+        // Very Low I/O priority and low memory priority for this thread, so the scan yields to interactive work.
+        // If background mode is refused, a lower CPU priority is still better than none.
+        bool backgroundMode = NtfsNative.SetThreadPriority(NtfsNative.GetCurrentThread(), NtfsNative.THREAD_MODE_BACKGROUND_BEGIN);
+        if (!backgroundMode)
+            Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
 
+        byte* buffer = null;
         try
         {
-            var spin = new SpinWait();
-            while (!cancellationToken.IsCancellationRequested && Volatile.Read(ref pendingDirectories) > 0)
+            WorkerStartedHook?.Invoke();
+
+            buffer = (byte*)NativeMemory.AlignedAlloc(BufferSize, 8);
+            var batchEntries = new List<PendingChildEntry>(256);
+            var dirNames = new List<string>(64);
+
+            while (workQueue.TryTake(cancellationToken, out var currentDir))
             {
-                if (workQueue.TryDequeue(out var currentDir))
+                try
                 {
-                    spin.Reset();
-                    try
-                    {
-                        // One bad directory must not lose the whole scan (an escaping exception would surface
-                        // from Task.WaitAll as an AggregateException): count it and carry on.
-                        ScanSingleDirectory(
-                            store,
-                            currentDir.NodeId,
-                            currentDir.Path,
-                            buffer,
-                            batchEntries,
-                            dirNames,
-                            workQueue,
-                            ref pendingDirectories,
-                            counters,
-                            cancellationToken);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        // Cancelled: the loop condition ends this worker and the caller rethrows
-                    }
-                    catch (Exception)
-                    {
-                        counters?.RecordIncomplete();
-                    }
-                    finally
-                    {
-                        Interlocked.Decrement(ref pendingDirectories);
-                    }
+                    // One bad directory must not lose the whole scan: count it and carry on.
+                    ScanSingleDirectory(
+                        store,
+                        currentDir.NodeId,
+                        currentDir.Path,
+                        buffer,
+                        batchEntries,
+                        dirNames,
+                        workQueue,
+                        counters,
+                        cancellationToken);
                 }
-                else
+                catch (OperationCanceledException)
                 {
-                    spin.SpinOnce();
+                    // Cancelled: TryTake ends this worker and the caller rethrows
+                }
+                catch (Exception)
+                {
+                    counters?.RecordIncomplete();
+                }
+                finally
+                {
+                    workQueue.Complete();
                 }
             }
         }
         finally
         {
-            NativeMemory.AlignedFree(buffer);
+            if (buffer != null)
+                NativeMemory.AlignedFree(buffer);
+            if (backgroundMode)
+                NtfsNative.SetThreadPriority(NtfsNative.GetCurrentThread(), NtfsNative.THREAD_MODE_BACKGROUND_END);
         }
     }
 
@@ -269,8 +369,7 @@ public static class VolumeScanner
         byte* buffer,
         List<PendingChildEntry> batchEntries,
         List<string> dirNames,
-        ConcurrentQueue<(int NodeId, string Path)> workQueue,
-        ref int pendingDirectories,
+        ScanQueue workQueue,
         ScanCounters? counters,
         CancellationToken ct)
     {
@@ -391,14 +490,12 @@ public static class VolumeScanner
 
         if (createdDirCount > 0)
         {
-            // Increment pendingDirectories BEFORE enqueueing so workers never premature-exit
-            Interlocked.Add(ref pendingDirectories, createdDirCount);
-
+            // Add counts each directory as pending before it can be taken, so workers never exit early
             string baseDir = dirPath.EndsWith('\\') ? dirPath : dirPath + "\\";
             for (int i = 0; i < createdDirCount; i++)
             {
                 string subPath = baseDir + dirNames[i];
-                workQueue.Enqueue((createdDirNodeIds[i], subPath));
+                workQueue.Add(createdDirNodeIds[i], subPath);
             }
         }
     }

@@ -1324,7 +1324,7 @@ public partial class MainWindow : Window
                 ApplyLiveStoreUpdatesToVisibleRows(session, args);
         }
 
-        int delay = session.PassDelayMs(Environment.TickCount64);
+        int delay = session.PassDelayMs(Environment.TickCount64, Volatile.Read(ref _hiddenInTray) ? HiddenMinGapMs : PassPacer.MinGapMs);
         if (delay <= 0)
         {
             Dispatcher.BeginInvoke(DispatcherPriority.Background, Run);
@@ -1525,7 +1525,7 @@ public partial class MainWindow : Window
     /// </summary>
     private void PulseActivityRows(FileSystemStore store, HashSet<int> activity)
     {
-        if (activity.Count == 0 || !SystemParameters.ClientAreaAnimation)
+        if (activity.Count == 0 || !IsVisible || !SystemParameters.ClientAreaAnimation)
             return;
 
         long now = Environment.TickCount64;
@@ -2603,14 +2603,24 @@ public partial class MainWindow : Window
         }
     }
 
+    // Hidden in the tray nobody sees the rows or the memory line: their timers and flashes rest, and live passes are
+    // spaced further apart (rows stay in step, they are just updated less often)
+    private const int HiddenMinGapMs = 2000;
+    private bool _hiddenInTray; // read from monitor threads too
+
     private void MinimizeToTray()
     {
+        Volatile.Write(ref _hiddenInTray, true);
+        _memoryTimer.Stop();
         Hide();
         ShowInTaskbar = false;
     }
 
     private void ShowAndActivateWindow()
     {
+        Volatile.Write(ref _hiddenInTray, false);
+        _memoryTimer.Start();
+        UpdateMemoryUsageDisplay();
         ShowInTaskbar = true;
         Show();
         WindowState = _lastNonMinimizedState == WindowState.Minimized ? WindowState.Normal : _lastNonMinimizedState;

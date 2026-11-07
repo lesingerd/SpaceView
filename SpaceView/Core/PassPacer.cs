@@ -10,15 +10,19 @@ public static class PassPacer
     public const int MinGapMs = 20;
     public const int MaxGapMs = 3000;
 
-    /// <summary>The gap that must follow a pass of the given duration.</summary>
-    public static long GapMs(long lastDurationMs) => Math.Clamp(lastDurationMs * GapFactor, MinGapMs, MaxGapMs);
+    /// <summary>
+    /// The gap that must follow a pass of the given duration; <paramref name="minGapMs"/> raises the floor (the window is
+    /// hidden in the tray and nobody sees the rows change).
+    /// </summary>
+    public static long GapMs(long lastDurationMs, int minGapMs = MinGapMs) =>
+        Math.Clamp(lastDurationMs * GapFactor, Math.Min(minGapMs, MaxGapMs), MaxGapMs);
 
     /// <summary>How long to wait from <paramref name="nowMs"/> before the next pass (0: run now).</summary>
-    public static int DelayMs(long nowMs, long lastEndMs, long lastDurationMs)
+    public static int DelayMs(long nowMs, long lastEndMs, long lastDurationMs, int minGapMs = MinGapMs)
     {
         if (lastEndMs <= 0)
             return 0;
-        long wait = lastEndMs + GapMs(lastDurationMs) - nowMs;
+        long wait = lastEndMs + GapMs(lastDurationMs, minGapMs) - nowMs;
         return wait <= 0 ? 0 : (int)Math.Min(wait, MaxGapMs);
     }
 }

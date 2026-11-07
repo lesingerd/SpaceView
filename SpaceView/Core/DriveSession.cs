@@ -301,8 +301,8 @@ public sealed class DriveSession : IDisposable
     }
 
     /// <summary>Milliseconds to wait before the next live-update pass may run (any thread).</summary>
-    public int PassDelayMs(long nowMs) =>
-        PassPacer.DelayMs(nowMs, Volatile.Read(ref _lastPassEndMs), Volatile.Read(ref _lastPassDurationMs));
+    public int PassDelayMs(long nowMs, int minGapMs = PassPacer.MinGapMs) =>
+        PassPacer.DelayMs(nowMs, Volatile.Read(ref _lastPassEndMs), Volatile.Read(ref _lastPassDurationMs), minGapMs);
 
     /// <summary>Forgets the collected nodes (the store was replaced or a branch was grafted: they no longer describe live changes).</summary>
     public void ClearActivity()

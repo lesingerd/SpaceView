@@ -632,8 +632,6 @@ public partial class MainWindow : Window
         session.ApplyScanResult(result);
         RebuildSessionRows(session, expandRoot);
         ResolveCutKeys();
-        StartMonitor(session, result);
-        RefreshRootRow(session);
 
         string inaccessible = result.InaccessibleDirectories > 0
             ? $"  •  {result.InaccessibleDirectories:N0} inaccessible folder(s) skipped"
@@ -642,9 +640,36 @@ public partial class MainWindow : Window
         string hint = result.InaccessibleDirectories > 0 && !ElevationHelper.IsElevated
             ? "  •  use \"Run as administrator\" to include them"
             : string.Empty;
-        StatusTextBlock.Text = rescanReason != null
-            ? $"Rescanned {session.RootPath} in {result.Duration.TotalSeconds:0.00}s ({rescanReason}){inaccessible}{hint}"
-            : $"Scanned {session.RootPath} in {result.Duration.TotalSeconds:0.00}s{inaccessible}{hint}";
+        string duration = SizeFormatter.FormatDuration(result.Duration);
+        string ComposeStatus(string journalNote) => rescanReason != null
+            ? $"Rescanned {session.RootPath} in {duration} ({rescanReason}){journalNote}{inaccessible}{hint}"
+            : $"Scanned {session.RootPath} in {duration}{journalNote}{inaccessible}{hint}";
+
+        // Changes the journal drain collected during the scan are applied by the new monitor in the background: say so now,
+        // and how many were applied when it is done (unless the status line has meanwhile shown something else).
+        // Lost changes mark the drive stale instead, with their own message.
+        UsnJournalBacklog? backlog = result.UsnBacklog;
+        string pendingText;
+        if (backlog == null || backlog.FailureReason != null)
+            pendingText = ComposeStatus(string.Empty);
+        else if (backlog.Batch.Items.Count == 0)
+            pendingText = ComposeStatus("  •  no changes made during the scan");
+        else
+            pendingText = ComposeStatus($"  •  applying {backlog.Batch.Items.Count:N0} changes made during the scan...");
+
+        StartMonitor(session, result, applied =>
+        {
+            if (backlog == null || backlog.FailureReason != null)
+                return;
+
+            Dispatcher.BeginInvoke(() =>
+            {
+                if (StatusTextBlock.Text == pendingText)
+                    StatusTextBlock.Text = ComposeStatus($"  •  applied {applied:N0} changes made during the scan");
+            });
+        });
+        RefreshRootRow(session);
+        StatusTextBlock.Text = pendingText;
 
         UpdateStatsText();
         UpdateMonitorBadge();
@@ -652,7 +677,7 @@ public partial class MainWindow : Window
         UpdateMemoryUsageDisplay();
     }
 
-    private void StartMonitor(DriveSession session, ScanResult result)
+    private void StartMonitor(DriveSession session, ScanResult result, Action<int> onBacklogApplied)
     {
         // Real-time monitoring for NTFS (USN journal, or the file watcher fallback); other file systems are not monitored
         if (!result.IsNtfs || session.Store == null)
@@ -663,6 +688,13 @@ public partial class MainWindow : Window
             result.UsnJournalReady,
             result.UsnJournalId,
             result.StartUsn);
+
+        // The journal changes read during the scan are applied first; the monitor then continues where the drain stopped
+        if (result.UsnBacklog != null)
+        {
+            monitor.SetBacklog(result.UsnBacklog);
+            monitor.BacklogApplied += (_, applied) => onBacklogApplied(applied);
+        }
 
         session.AttachMonitor(
             monitor,

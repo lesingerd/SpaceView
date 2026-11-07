@@ -32,6 +32,7 @@ When launched, SpaceView presents a drive selector drop-down displaying all read
 - **Real-Time NTFS USN Change Journal Monitoring**:
   - Queries the NTFS USN Journal (`FSCTL_QUERY_USN_JOURNAL`) prior to scanning and continuously tails `FSCTL_READ_USN_JOURNAL` (`USN_RECORD_V2`) records in the background (with automatic fallback to `FileSystemWatcher` when running unprivileged or on non-NTFS volumes).
   - Propagates file creations, deletions, renames, and size changes up the parent directory chain in $O(\text{depth})$ time and updates the visible tree and percentages live.
+  - While a drive is scanned, the journal is read in the background and the changes are buffered in memory, so a small, busy journal (such as the system volume's) can wrap during a long scan without losing anything; they are applied to the new tree when the scan finishes. If the buffer overflows or the journal wraps anyway, the drive is marked stale.
 - **System Tray Application & Custom Hover Popup**:
   - Minimizes cleanly to the Windows System Tray.
   - **Hover Popup**: Hovering over the tray icon displays a sleek non-activating popup card showing all current drives, free space, free/used percentages, and color-coded graphical bars.
@@ -64,6 +65,8 @@ SpaceView/
     │   ├── FileSystemStore.cs           # Arena-backed struct store & O(depth) USN delta engine
     │   ├── VolumeScanner.cs             # Multi-threaded native volume scanner
     │   ├── NtfsUsnJournalMonitor.cs     # Real-time NTFS USN Change Journal monitor
+    │   ├── UsnJournalReader.cs          # Shared journal record reader
+    │   ├── UsnJournalDrainer.cs         # Reads the journal while a scan runs and hands it to the monitor
     │   └── SizeFormatter.cs             # Human-readable byte formatting utility
     ├── Models/
     │   ├── DriveItemViewModel.cs        # Drive metadata & capacity bar model

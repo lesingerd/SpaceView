@@ -41,47 +41,7 @@ public sealed class UsnMonitorStatusEventArgs : EventArgs
 /// </summary>
 public sealed class NtfsUsnJournalMonitor : IDisposable
 {
-    private const uint ReadBufferSize = 64 * 1024;
-
-    // MFT records 0-23 are reserved for NTFS metadata files ($MFT, $LogFile, $Bitmap, ...)
-    private const ulong MftIndexMask = 0x0000FFFFFFFFFFFFUL;
-    private const ulong FirstUserMftIndex = 24;
-
     private const int MaxFallbackDirectoryEntries = 2000;
-
-    private const uint MonitoredReasons =
-        NtfsNative.USN_REASON_FILE_CREATE |
-        NtfsNative.USN_REASON_FILE_DELETE |
-        NtfsNative.USN_REASON_DATA_EXTEND |
-        NtfsNative.USN_REASON_DATA_TRUNCATION |
-        NtfsNative.USN_REASON_DATA_OVERWRITE |
-        NtfsNative.USN_REASON_RENAME_OLD_NAME |
-        NtfsNative.USN_REASON_RENAME_NEW_NAME |
-        NtfsNative.USN_REASON_HARD_LINK_CHANGE |
-        NtfsNative.USN_REASON_CLOSE;
-
-    private struct UsnBatchItem
-    {
-        public ulong ParentFrn;
-        public string Name;
-        public uint CombinedReason;
-        public uint Attrs;
-    }
-
-    /// <summary>Records of one poll, keyed by FRN but remembered in USN (first-seen) order.</summary>
-    private sealed class UsnBatch
-    {
-        public readonly Dictionary<ulong, UsnBatchItem> Items = new(256);
-        public readonly List<ulong> Order = new(256);
-        public string LastItemName = string.Empty;
-
-        public void Clear()
-        {
-            Items.Clear();
-            Order.Clear();
-            LastItemName = string.Empty;
-        }
-    }
 
     private readonly FileSystemStore _store;
     private ulong _journalId;
@@ -95,6 +55,7 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
     private string? _lastFaultMessage;
     private bool _faultReportedThisPoll;
     private bool _disposed;
+    private UsnJournalBacklog? _backlog;
 
     // Held while a journal batch is read and applied, so a pause request waits for an in-flight batch
     private readonly object _applyGate = new();
@@ -111,6 +72,12 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
     /// <summary>Raised (on a background thread) for faults and for a switch to the fallback watcher.</summary>
     public event EventHandler<UsnMonitorStatusEventArgs>? StatusChanged;
 
+    /// <summary>
+    /// Raised (on a background thread) once the changes the journal drain collected during the scan have been applied;
+    /// the argument is the number applied.
+    /// </summary>
+    public event EventHandler<int>? BacklogApplied;
+
     public NtfsUsnJournalMonitor(
         FileSystemStore store,
         bool usnReady,
@@ -121,6 +88,19 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         _journalId = journalId;
         _nextUsn = startUsn;
         _usnActive = usnReady && journalId != 0;
+    }
+
+    /// <summary>
+    /// Hands over what the journal drain collected while the tree was being scanned (call before <see cref="Start"/>).
+    /// The monitor applies those changes first, through the normal batch path, then continues from the drain's position.
+    /// If the drain lost changes, the monitor still continues from there but signals <see cref="RescanRequired"/> at once.
+    /// </summary>
+    internal void SetBacklog(UsnJournalBacklog backlog)
+    {
+        _backlog = backlog;
+        if (backlog.JournalId != 0)
+            _journalId = backlog.JournalId;
+        _nextUsn = backlog.NextUsn;
     }
 
     public void Start()
@@ -189,14 +169,21 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
                 0,
                 IntPtr.Zero);
 
+            int openError = hVolume.IsInvalid ? Marshal.GetLastWin32Error() : 0;
+
+            // What the drain collected during the scan goes in first; without a usable volume handle the nodes are
+            // still found by path
+            UsnJournalBacklog? backlog = Interlocked.Exchange(ref _backlog, null);
+            if (backlog != null)
+                ApplyBacklog(hVolume, backlog, ct);
+
             if (hVolume.IsInvalid)
             {
-                int err = Marshal.GetLastWin32Error();
-                SwitchToFallback($"Could not open the volume for USN journal access (Win32 error {err})");
+                SwitchToFallback($"Could not open the volume for USN journal access (Win32 error {openError})");
                 return;
             }
 
-            IntPtr bufferPtr = AllocateAlignedBuffer();
+            IntPtr bufferPtr = UsnJournalReader.AllocateAlignedBuffer();
             try
             {
                 var batch = new UsnBatch();
@@ -227,7 +214,7 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
             }
             finally
             {
-                FreeAlignedBuffer(bufferPtr);
+                UsnJournalReader.FreeAlignedBuffer(bufferPtr);
             }
         }
         catch (OperationCanceledException)
@@ -240,112 +227,28 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         }
     }
 
-    private static unsafe IntPtr AllocateAlignedBuffer()
-    {
-        return (IntPtr)NativeMemory.AlignedAlloc(ReadBufferSize, 8);
-    }
-
-    private static unsafe void FreeAlignedBuffer(IntPtr ptr)
-    {
-        if (ptr != IntPtr.Zero)
-        {
-            NativeMemory.AlignedFree((void*)ptr);
-        }
-    }
-
-    private unsafe void PollAndApplyUsnBatch(
+    private void PollAndApplyUsnBatch(
         SafeFileHandle hVolume,
         IntPtr bufferPtr,
         UsnBatch batch,
         CancellationToken ct)
     {
-        byte* buffer = (byte*)bufferPtr;
         batch.Clear();
 
         while (!ct.IsCancellationRequested)
         {
-            var readData = new NtfsNative.READ_USN_JOURNAL_DATA_V0
+            UsnChunkResult chunk = UsnJournalReader.ReadChunk(hVolume, bufferPtr, _journalId, ref _nextUsn, batch, out int readError);
+            if (chunk == UsnChunkResult.Failed)
             {
-                StartUsn = _nextUsn,
-                ReasonMask = MonitoredReasons,
-                ReturnOnlyOnClose = 0,
-                Timeout = 0,
-                BytesToWaitFor = 0,
-                UsnJournalID = _journalId
-            };
-
-            if (!NtfsNative.DeviceIoControl(
-                hVolume,
-                NtfsNative.FSCTL_READ_USN_JOURNAL,
-                &readData,
-                (uint)sizeof(NtfsNative.READ_USN_JOURNAL_DATA_V0),
-                buffer,
-                ReadBufferSize,
-                out uint bytesReturned,
-                IntPtr.Zero))
-            {
-                HandleJournalReadFailure(hVolume, Marshal.GetLastWin32Error());
+                HandleJournalReadFailure(hVolume, readError);
                 break;
             }
 
             // A successful read means the journal position is valid again
             Volatile.Write(ref _rescanSignalled, 0);
 
-            if (bytesReturned < sizeof(long))
+            if (chunk == UsnChunkResult.End)
                 break;
-
-            long nextUsn = *(long*)buffer;
-            if (nextUsn <= _nextUsn)
-                break;
-
-            // Advance even when every new record was filtered out, so the position never lags
-            // behind the journal tail and falls off the end of the (circular) journal.
-            _nextUsn = nextUsn;
-
-            if (bytesReturned == sizeof(long))
-                break;
-
-            uint offset = sizeof(long);
-            while (offset + sizeof(NtfsNative.USN_RECORD_V2) <= bytesReturned)
-            {
-                NtfsNative.USN_RECORD_V2* rec = (NtfsNative.USN_RECORD_V2*)(buffer + offset);
-                if (rec->RecordLength == 0)
-                    break;
-
-                // Skip NTFS metadata files ($MFT, $LogFile, ...) by MFT record number, not by name:
-                // legitimate "$" names (e.g. Recycle Bin $R... renames) must still be tracked.
-                ulong frn = rec->FileReferenceNumber;
-                if (rec->MajorVersion == 2 &&
-                    (frn & MftIndexMask) >= FirstUserMftIndex &&
-                    rec->FileNameOffset + rec->FileNameLength <= rec->RecordLength)
-                {
-                    char* namePtr = (char*)((byte*)rec + rec->FileNameOffset);
-                    int charLen = rec->FileNameLength / sizeof(char);
-                    if (charLen > 0)
-                    {
-                        string name = new string(namePtr, 0, charLen);
-                        uint combinedReason = rec->Reason;
-                        if (batch.Items.TryGetValue(frn, out var prev))
-                        {
-                            combinedReason |= prev.CombinedReason;
-                        }
-                        else
-                        {
-                            batch.Order.Add(frn);
-                        }
-                        batch.Items[frn] = new UsnBatchItem
-                        {
-                            ParentFrn = rec->ParentFileReferenceNumber,
-                            Name = name,
-                            CombinedReason = combinedReason,
-                            Attrs = rec->FileAttributes
-                        };
-                        batch.LastItemName = name;
-                    }
-                }
-
-                offset += rec->RecordLength;
-            }
 
             // Cap batch size so UI updates stay responsive during heavy disk writes
             if (batch.Items.Count >= 2000)
@@ -355,6 +258,12 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         if (batch.Items.Count == 0)
             return;
 
+        ApplyAndReport(hVolume, batch, ct);
+    }
+
+    /// <summary>Applies a batch to the store and tells listeners what changed.</summary>
+    private int ApplyAndReport(SafeFileHandle hVolume, UsnBatch batch, CancellationToken ct)
+    {
         int appliedCount = ApplyBatch(hVolume, batch, ct);
         int[] changedNodes = _store.TakeActivity();
 
@@ -370,6 +279,28 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
                 ChangedNodes = changedNodes
             });
         }
+        return appliedCount;
+    }
+
+    /// <summary>
+    /// Applies the changes the journal drain collected during the scan, as one batch (so the parent-before-child retry
+    /// sees all of them), and then reports a lost-changes failure of the drain, if any. Replaying a record the scan
+    /// already reflects changes nothing: see <see cref="UsnJournalDrainer"/>. Returns the number of changes applied.
+    /// </summary>
+    internal int ApplyBacklog(SafeFileHandle hVolume, UsnJournalBacklog backlog, CancellationToken ct)
+    {
+        int applied = 0;
+        lock (_applyGate)
+        {
+            if (backlog.Batch.Items.Count > 0)
+                applied = ApplyAndReport(hVolume, backlog.Batch, ct);
+        }
+        backlog.Batch.Clear(); // the records are applied; free the memory
+
+        BacklogApplied?.Invoke(this, applied);
+        if (backlog.FailureReason != null)
+            RaiseRescanRequired(backlog.FailureReason);
+        return applied;
     }
 
     /// <summary>
@@ -513,42 +444,11 @@ public sealed class NtfsUsnJournalMonitor : IDisposable
         }
     }
 
-    private unsafe void HandleJournalReadFailure(SafeFileHandle hVolume, int readError)
+    private void HandleJournalReadFailure(SafeFileHandle hVolume, int readError)
     {
-        NtfsNative.USN_JOURNAL_DATA_V0 journal = default;
-        bool queried = NtfsNative.DeviceIoControl(
-            hVolume,
-            NtfsNative.FSCTL_QUERY_USN_JOURNAL,
-            null,
-            0,
-            &journal,
-            (uint)sizeof(NtfsNative.USN_JOURNAL_DATA_V0),
-            out _,
-            IntPtr.Zero);
-        int queryError = queried ? 0 : Marshal.GetLastWin32Error();
-
-        if (queried)
+        if (UsnJournalReader.IsPositionLost(hVolume, readError, ref _journalId, ref _nextUsn, out string lostMessage))
         {
-            bool lostPosition =
-                readError == NtfsNative.ERROR_JOURNAL_ENTRY_DELETED ||
-                readError == NtfsNative.ERROR_JOURNAL_NOT_ACTIVE ||
-                journal.UsnJournalID != _journalId ||
-                _nextUsn < journal.LowestValidUsn;
-
-            if (lostPosition)
-            {
-                // Re-sync to the current journal tail; the tree itself must be rebuilt by a rescan
-                _journalId = journal.UsnJournalID;
-                _nextUsn = journal.NextUsn;
-                RaiseRescanRequired($"The NTFS change journal was reset or wrapped (Win32 error {readError})");
-                return;
-            }
-        }
-        else if (queryError == NtfsNative.ERROR_JOURNAL_NOT_ACTIVE ||
-                 readError == NtfsNative.ERROR_JOURNAL_NOT_ACTIVE ||
-                 readError == NtfsNative.ERROR_JOURNAL_ENTRY_DELETED)
-        {
-            RaiseRescanRequired($"The NTFS change journal is no longer active (Win32 error {readError})");
+            RaiseRescanRequired(lostMessage);
             return;
         }
 

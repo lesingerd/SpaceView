@@ -263,6 +263,17 @@ public static unsafe class NtfsNative
         return false;
     }
 
+    /// <summary>Enter background processing mode (Very Low I/O priority, low memory priority) for the calling thread.</summary>
+    public const int THREAD_MODE_BACKGROUND_BEGIN = 0x00010000;
+    public const int THREAD_MODE_BACKGROUND_END = 0x00020000;
+
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetCurrentThread();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetThreadPriority(IntPtr hThread, int nPriority);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern SafeFileHandle OpenFileById(
         SafeFileHandle hVolumeHint,

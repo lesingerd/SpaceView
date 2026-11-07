@@ -144,7 +144,7 @@ public static class VolumeScanner
     /// </summary>
     internal static int GetScanWorkerCount(string path)
     {
-        const int SystemVolumeWorkers = 4;
+        const int SystemVolumeWorkers = 2;
         try
         {
             string? root = Path.GetPathRoot(Path.GetFullPath(path));

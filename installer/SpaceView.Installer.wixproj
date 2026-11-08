@@ -1,0 +1,25 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+
+  <PropertyGroup>
+    <OutputName>SpaceView</OutputName>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <ProductVersion Condition="'$(ProductVersion)' == ''">1.0.0</ProductVersion>
+    <!-- Folder produced by 'dotnet publish' (set by build-installer.ps1) -->
+    <PayloadDir Condition="'$(PayloadDir)' == ''">$(MSBuildThisFileDirectory)..\artifacts\installer\payload</PayloadDir>
+    <IconFile>$(MSBuildThisFileDirectory)..\SpaceView\Assets\SpaceView.ico</IconFile>
+    <DefineConstants>$(DefineConstants);ProductVersion=$(ProductVersion);IconFile=$(IconFile)</DefineConstants>
+    <!-- ICE61: same-version upgrades are intended. Per-user package: ICE38/ICE64/ICE91 complain about files in the user profile without HKCU key paths -->
+    <SuppressIces>ICE38;ICE61;ICE64;ICE91</SuppressIces>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <BindPath Include="$(PayloadDir)" BindName="payload" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.UI.wixext" Version="5.0.2" />
+    <PackageReference Include="WixToolset.Util.wixext" Version="5.0.2" />
+  </ItemGroup>
+
+</Project>

@@ -1461,7 +1461,65 @@ public partial class MainWindow : Window
     private LiveRowSync<TreeRowViewModel> RowSync => _rowSyncInstance ??= new LiveRowSync<TreeRowViewModel>(
         (snapshot, depth) => new TreeRowViewModel(_syncSession!, _syncStore!, snapshot, depth),
         (parentNodeId, depth, remaining) => TreeRowViewModel.CreateMoreRow(_syncSession!, _syncStore!, parentNodeId, depth, remaining),
-        ChildPageSize);
+        ChildPageSize)
+    {
+        BeforeReorder = NoteViewBeforeReorder,
+        AfterReorder = RestoreViewAfterReorder,
+    };
+
+    // The view as it was when the live sync re-ordered rows: the first visible row and the focused row
+    private TreeRowViewModel? _reorderAnchorRow;
+    private TreeRowViewModel? _reorderFocusRow;
+    private ScrollViewer? _reorderScrollViewer;
+
+    /// <summary>
+    /// A re-order is announced as a Reset, which drops the selection (the window puts it back by key, see
+    /// <see cref="RestoreSelectionAfterReset"/>) and keeps the scroll offset as a row index: note the first visible row and
+    /// the focused row, so the same rows can be put back where the user was looking.
+    /// </summary>
+    private void NoteViewBeforeReorder()
+    {
+        _reorderAnchorRow = null;
+        _reorderFocusRow = null;
+        _reorderScrollViewer = FindDescendant<ScrollViewer>(TreeListBox);
+        if (_reorderScrollViewer != null)
+        {
+            int index = (int)_reorderScrollViewer.VerticalOffset; // ScrollUnit="Item": the offset is the index of the first row
+            if (index > 0 && index < _visibleRows.Count)
+                _reorderAnchorRow = _visibleRows[index];
+        }
+        if (TreeListBox.IsKeyboardFocusWithin && Keyboard.FocusedElement is ListBoxItem { DataContext: TreeRowViewModel focused })
+            _reorderFocusRow = focused;
+    }
+
+    private void RestoreViewAfterReorder()
+    {
+        TreeRowViewModel? anchor = _reorderAnchorRow;
+        TreeRowViewModel? focused = _reorderFocusRow;
+        ScrollViewer? scrollViewer = _reorderScrollViewer;
+        _reorderAnchorRow = null;
+        _reorderFocusRow = null;
+        _reorderScrollViewer = null;
+        if (anchor == null && focused == null)
+            return;
+
+        // The containers are rebuilt by layout, so the scroll offset and the focus are put back after it
+        Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () =>
+        {
+            if (anchor != null && scrollViewer != null)
+            {
+                int index = _visibleRows.IndexOf(anchor);
+                if (index >= 0 && (int)scrollViewer.VerticalOffset != index)
+                    scrollViewer.ScrollToVerticalOffset(index);
+            }
+            if (focused != null)
+            {
+                TreeListBox.UpdateLayout();
+                if (TreeListBox.ItemContainerGenerator.ContainerFromItem(focused) is ListBoxItem item && !item.IsKeyboardFocusWithin)
+                    item.Focus();
+            }
+        });
+    }
 
     /// <summary>
     /// Brings this drive's rows in line with the store after live changes. Unless <paramref name="full"/> (the store was
@@ -1484,7 +1542,9 @@ public partial class MainWindow : Window
         //    the "more items" rows), 3. refresh the sizes, counts and % of parent of the rows that can have changed
         _syncSession = session;
         _syncStore = store;
-        end = RowSync.Apply(_visibleRows, start, end, store, fullPass ? null : activity, out bool needsFullNext);
+        // 3b. rows whose size moved them out of order are re-ordered, unless a menu or a dialog is up (the next pass does it)
+        bool allowReorder = !_rowMenuOpen && !_fileOperationInProgress && IsMainWindowEnabled();
+        end = RowSync.Apply(_visibleRows, start, end, store, fullPass ? null : activity, out bool needsFullNext, allowReorder);
         if (needsFullNext)
             session.NeedsFullSync = true;
         RefreshRootRow(session);

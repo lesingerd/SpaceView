@@ -33,15 +33,30 @@ public interface IRowList<TRow>
     void Insert(int index, TRow row);
     void RemoveAt(int index);
     void RemoveRange(int index, int count);
+    /// <summary>Replaces <paramref name="removeCount"/> rows at <paramref name="index"/> with <paramref name="newItems"/> in one step (one change notification).</summary>
+    void ReplaceRange(int index, int removeCount, IReadOnlyList<TRow> newItems);
 }
 
 /// <summary>
 /// Brings the visible rows of one drive in line with the store after live changes, in time linear in the rows (not
 /// quadratic): rows of deleted or moved nodes are removed, new children of expanded folders are inserted at their sorted
-/// place among the visible siblings (existing rows are never re-ordered), each folder's "more items" row keeps its count,
-/// and the displayed numbers are refreshed. With a set of changed nodes only the rows that can have changed are looked at
-/// (the changed nodes, their ancestors, and the children of those, whose percentages depend on them) and a folder's
-/// children are never listed or sorted; without one ("full") every row and every expanded folder is checked.
+/// place among the visible siblings, each folder's "more items" row keeps its count, and the displayed numbers are
+/// refreshed. With a set of changed nodes only the rows that can have changed are looked at (the changed nodes, their
+/// ancestors, and the children of those, whose percentages depend on them) and a folder's children are never listed or
+/// sorted; without one ("full") every row and every expanded folder is checked.
+/// <para>
+/// After the numbers are refreshed the visible children of each such folder are checked against the order (largest first,
+/// equal sizes by node id) in one linear scan, since a size that changed live can put a row out of place. A folder is only
+/// re-ordered when some adjacent pair is out of order by more than <c>min(1% of the larger size, 1 MB)</c> (so rows of
+/// near-equal size do not swap back and forth on every pass); it is then sorted exactly. Each child moves together with
+/// its block of visible descendant rows (the existing row objects are moved, none is recreated), the folder's "more items"
+/// row stays last, and all re-ordered folders of the pass are applied with one <see cref="IRowList{TRow}.ReplaceRange"/>
+/// over the span that changed. A folder with hidden children (a "more items" row) is re-sorted among its visible children
+/// only: a visible child that now ranks below a hidden one stays in the page, in its sorted place among the visible
+/// siblings, until the folder is expanded again. The drive's root row is not a sibling of anything here, so the order of
+/// the drives is never touched. The window can pass allowReorder false (a menu or dialog is open); the need is then
+/// reported through needsFullNext.
+/// </para>
 /// Holds its scratch collections between calls, so a pass allocates little. Single threaded (UI thread).
 /// </summary>
 public sealed class LiveRowSync<TRow> where TRow : class, ILiveRow
@@ -91,6 +106,36 @@ public sealed class LiveRowSync<TRow> where TRow : class, ILiveRow
     private TRow[] _refreshRows = Array.Empty<TRow>();
     private NodeRowValues[] _refreshVals = Array.Empty<NodeRowValues>();
     private int _seq;
+
+    private struct Block
+    {
+        public int Start;
+        public int End;
+        public long Size;
+        public int Id;
+    }
+
+    private readonly HashSet<int> _flagged = new();
+    private readonly HashSet<int> _path = new();
+    private readonly List<Block> _blocks = new();
+    private readonly List<TRow> _output = new();
+    private int[] _parentPos = new int[16];
+    private int[] _prevId = new int[16];
+    private long[] _prevSize = new long[16];
+    private bool[] _prevSet = new bool[16];
+
+    private static readonly IComparer<Block> BlockOrder = Comparer<Block>.Create((a, b) => CompareRank(a.Size, a.Id, b.Size, b.Id));
+
+    /// <summary>An adjacent pair counts as out of order only when the lower one is larger by more than 1% of its size or 1 MB, whichever is less.</summary>
+    private const long ResortMinBytes = 1024 * 1024;
+
+    /// <summary>Called just before rows are re-ordered (the window notes the scroll anchor and focus).</summary>
+    public Action? BeforeReorder { get; set; }
+    /// <summary>Called right after rows were re-ordered (the window puts the scroll anchor and focus back).</summary>
+    public Action? AfterReorder { get; set; }
+
+    /// <summary>The number of folders whose children were re-ordered by the last <see cref="Apply"/>.</summary>
+    public int ReorderedFolders { get; private set; }
 
     private static readonly Comparison<Cand> ByParentThenRank = (a, b) =>
     {
@@ -162,6 +207,11 @@ public sealed class LiveRowSync<TRow> where TRow : class, ILiveRow
         Shrink(_shownIds);
         Shrink(_children);
         Shrink(_affected);
+        Shrink(_flagged);
+        Shrink(_path);
+        Shrink(_blocks);
+        _output.Clear();
+        Shrink(_output);
         if (_changedVals.Length > RetainLimit) _changedVals = Array.Empty<NodeRowValues>();
         if (_refreshIds.Length > RetainLimit) _refreshIds = Array.Empty<int>();
         if (_refreshRows.Length > RetainLimit) _refreshRows = Array.Empty<TRow>();
@@ -210,9 +260,11 @@ public sealed class LiveRowSync<TRow> where TRow : class, ILiveRow
     /// folder that was still loading had to be skipped, so the next pass should be a full one.
     /// </summary>
     public int Apply(
-        IRowList<TRow> rows, int start, int end, FileSystemStore store, IReadOnlyCollection<int>? changed, out bool needsFullNext)
+        IRowList<TRow> rows, int start, int end, FileSystemStore store, IReadOnlyCollection<int>? changed, out bool needsFullNext,
+        bool allowReorder = true)
     {
         needsFullNext = false;
+        ReorderedFolders = 0;
         _removals.Clear();
         _edits.Clear();
         _seq = 0;
@@ -224,6 +276,7 @@ public sealed class LiveRowSync<TRow> where TRow : class, ILiveRow
 
         end += ApplyEdits(rows);
         Refresh(rows, start, end, store, changed);
+        Reorder(rows, start, end, changed, allowReorder, ref needsFullNext);
         return end;
     }
 
@@ -628,6 +681,154 @@ public sealed class LiveRowSync<TRow> where TRow : class, ILiveRow
                 row.ApplySnapshot(store.GetNodeInfo(row.NodeId));
         }
         Array.Clear(_refreshRows, 0, count); // do not keep rows alive
+    }
+
+    // ---------------------------------------------------------------------
+    // Order
+    // ---------------------------------------------------------------------
+
+    /// <summary>
+    /// Finds the folders whose visible children are out of order (one linear pass; with a changed set only inside the folders
+    /// that are ancestors of a change, which Refresh just collected) and re-orders them with one ReplaceRange.
+    /// </summary>
+    private void Reorder(IRowList<TRow> rows, int start, int end, IReadOnlyCollection<int>? changed, bool allowReorder, ref bool needsFullNext)
+    {
+        bool all = changed == null;
+        if (end - start < 3 || (!all && changed!.Count == 0))
+            return;
+
+        _flagged.Clear();
+        _path.Clear();
+        int top = 0;
+        int skipBelow = -1;
+        _parentPos[0] = start;
+        _prevSet[0] = false;
+        for (int i = start + 1; i < end; i++)
+        {
+            TRow row = rows[i];
+            int d = row.Depth;
+            if (skipBelow >= 0)
+            {
+                if (d > skipBelow)
+                    continue;
+                skipBelow = -1;
+            }
+            if (row.IsMoreRow || d < 1)
+                continue;
+
+            if (d >= _parentPos.Length - 1)
+            {
+                int cap = d * 2 + 2;
+                Array.Resize(ref _parentPos, cap);
+                Array.Resize(ref _prevId, cap);
+                Array.Resize(ref _prevSize, cap);
+                Array.Resize(ref _prevSet, cap);
+            }
+            // A row at depth d starts a new run of siblings below it; the rows of a deeper run are over
+            for (int k = d + 1; k <= top; k++)
+                _prevSet[k] = false;
+            if (d > top)
+                _prevSet[d] = false;
+            top = d;
+
+            long size = row.Size;
+            if (_prevSet[d] && Before(size, row.NodeId, _prevSize[d], _prevId[d]))
+            {
+                long diff = size - _prevSize[d];
+                int pPos = _parentPos[d - 1];
+                if (diff > Math.Min(size / 100, ResortMinBytes) && !rows[pPos].IsLoadingChildren)
+                {
+                    _flagged.Add(pPos);
+                    for (int k = 0; k < d; k++)
+                        _path.Add(_parentPos[k]);
+                }
+            }
+            _prevSet[d] = true;
+            _prevSize[d] = size;
+            _prevId[d] = row.NodeId;
+            _parentPos[d] = i;
+
+            if (!all && row.IsDirectory && !_affected.Contains(row.NodeId))
+                skipBelow = d;
+        }
+        if (_flagged.Count == 0)
+            return;
+        if (!allowReorder)
+        {
+            needsFullNext = true; // a menu or dialog is up: look again on the next pass
+            _flagged.Clear();
+            _path.Clear();
+            return;
+        }
+
+        _output.Clear();
+        _blocks.Clear();
+        _output.Add(rows[start]);
+        EmitChildren(rows, start, end);
+
+        // Only the span between the first and the last row that moved is replaced
+        int first = 0;
+        int count = end - start;
+        while (first < count && ReferenceEquals(_output[first], rows[start + first]))
+            first++;
+        int last = count - 1;
+        while (last > first && ReferenceEquals(_output[last], rows[start + last]))
+            last--;
+        if (first < count)
+        {
+            BeforeReorder?.Invoke();
+            rows.ReplaceRange(start + first, last - first + 1, _output.GetRange(first, last - first + 1));
+            AfterReorder?.Invoke();
+            ReorderedFolders = _flagged.Count;
+        }
+        _output.Clear();
+        _blocks.Clear();
+        _flagged.Clear();
+        _path.Clear();
+    }
+
+    /// <summary>
+    /// Appends to _output the rows below the folder row at <paramref name="pPos"/> up to <paramref name="pEnd"/>: a folder
+    /// that is on the path to a flagged one is taken apart into its child blocks (sorted if it is flagged itself, with the
+    /// "more items" row last), any other block is copied as it is.
+    /// </summary>
+    private void EmitChildren(IRowList<TRow> rows, int pPos, int pEnd)
+    {
+        if (!_path.Contains(pPos))
+        {
+            for (int j = pPos + 1; j < pEnd; j++)
+                _output.Add(rows[j]);
+            return;
+        }
+
+        int childDepth = rows[pPos].Depth + 1;
+        int baseIdx = _blocks.Count;
+        int morePos = -1;
+        for (int j = pPos + 1; j < pEnd;)
+        {
+            TRow r = rows[j];
+            int e = j + 1;
+            while (e < pEnd && rows[e].Depth > childDepth)
+                e++;
+            if (r.IsMoreRow)
+                morePos = j;
+            else
+                _blocks.Add(new Block { Start = j, End = e, Size = r.Size, Id = r.NodeId });
+            j = e;
+        }
+        int n = _blocks.Count;
+        if (_flagged.Contains(pPos))
+            _blocks.Sort(baseIdx, n - baseIdx, BlockOrder);
+
+        for (int b = baseIdx; b < n; b++)
+        {
+            Block blk = _blocks[b];
+            _output.Add(rows[blk.Start]);
+            EmitChildren(rows, blk.Start, blk.End);
+        }
+        if (morePos >= 0)
+            _output.Add(rows[morePos]);
+        _blocks.RemoveRange(baseIdx, n - baseIdx);
     }
 
     private static void Ensure<T>(ref T[] array, int size)

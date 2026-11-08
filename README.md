@@ -105,6 +105,18 @@ Output goes to `artifacts\publish` (git-ignored) and the script finishes with a 
 - To publish elsewhere: `.\build.ps1 -OutputDir "C:\Temp\SpaceView"`
 - To wipe the output folder first: `.\build.ps1 -Clean` (only folders inside the repo's `artifacts` folder can be cleaned)
 
+### Installer (MSI for Testers)
+Double-click `build-installer.bat` or run `build-installer.ps1` to produce a self-contained MSI that can be sent to someone else:
+```powershell
+.\build-installer.ps1
+```
+Output: `artifacts\installer\SpaceView-<version>-x64.msi` (version is `1.0.<git commit count>`). The script publishes a self-contained win-x64 build and packages it with [WiX Toolset v5](https://wixtoolset.org/) (pulled from nuget.org by the build; nothing is installed globally, and the installer project is not part of `SpaceView.sln`).
+
+- **Per-user, no admin rights**: installs to `%LOCALAPPDATA%\Programs\SpaceView` and adds a Start Menu shortcut; uninstall from Settings > Apps.
+- **Bundles .NET**: the tester does not need the .NET runtime installed.
+- **Unsigned**: Windows SmartScreen will show "Windows protected your PC". Click **More info** then **Run anyway**.
+- Installing a newer MSI upgrades in place. The same `-Clean` / `-OutputDir` options as `build.ps1` are available.
+
 ### Build & Run Manually via CLI
 ```powershell
 dotnet build SpaceView.sln -c Release

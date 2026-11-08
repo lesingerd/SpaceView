@@ -1,0 +1,58 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Package Name="SpaceView"
+           Manufacturer="SpaceView"
+           Version="$(ProductVersion)"
+           UpgradeCode="E9DA02B6-8642-4A7D-9DD8-9338407F7796"
+           Scope="perUser"
+           Compressed="yes">
+
+    <SummaryInformation Description="SpaceView - Disk Consumption &amp; Live NTFS USN Monitor" />
+
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of SpaceView is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="SpaceView.ico" SourceFile="$(IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="SpaceView.ico" />
+
+    <!-- Ask a running SpaceView to close (Restart Manager) instead of failing on locked files -->
+    <util:CloseApplication Target="SpaceView.exe" CloseMessage="yes" RebootPrompt="no" />
+
+    <!-- Minimal UI with an optional "Launch SpaceView" checkbox on the finish page -->
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="license.rtf" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch SpaceView" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <CustomAction Id="LaunchSpaceView" Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[INSTALLFOLDER]SpaceView.exe&quot;"
+                  Return="asyncNoWait" Impersonate="yes" />
+    <UI>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchSpaceView"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed" />
+    </UI>
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolderLocal" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="SpaceView">
+          <!-- Every file of the self-contained publish output -->
+          <Files Include="!(bindpath.payload)\**" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="*">
+        <Shortcut Id="SpaceViewShortcut" Name="SpaceView"
+                  Description="SpaceView - Disk Consumption &amp; Live NTFS USN Monitor"
+                  Target="[INSTALLFOLDER]SpaceView.exe" WorkingDirectory="INSTALLFOLDER"
+                  Icon="SpaceView.ico" />
+        <RegistryValue Root="HKCU" Key="Software\SpaceView" Name="StartMenuShortcut"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+  </Package>
+</Wix>
